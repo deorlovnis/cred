@@ -10,6 +10,8 @@ mod approve;
 mod audit;
 mod browse;
 mod browser;
+#[allow(dead_code)] // until `cred box` uses the door
+mod door;
 mod fetch;
 mod index;
 mod keychain;
