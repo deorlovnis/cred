@@ -163,6 +163,10 @@ pub struct Browse {
     /// The browser closes this long after it opened, however busy. 0: never.
     #[serde(default = "default_max_minutes")]
     pub max_minutes: u64,
+    /// Fields (a login's user and password) cred may type into pages on the origins, for
+    /// sites without a session to inject. Off unless listed.
+    #[serde(default)]
+    pub fill: Vec<String>,
 }
 
 fn default_idle_minutes() -> u64 {
@@ -290,6 +294,12 @@ impl Browse {
                 bail!("[browse] cookie {} domain '{}' doesn't cover one of the origins", c.name, c.domain);
             }
         }
+        for field in &self.fill {
+            parse_field(field).map_err(|e| anyhow!("[browse] fill '{field}': {e}"))?;
+        }
+        if !self.fill.is_empty() && origins.iter().any(|s| matches!(s, Site::Any)) {
+            bail!("[browse] fill can't be used with origins = [\"*\"]: name the sites cred may type credentials into");
+        }
         for s in &self.local_storage {
             parse_field(&s.field).map_err(|e| anyhow!("[browse] local_storage {}: field: {e}", s.key))?;
             let origin = host_origin(&s.origin).map_err(|e| anyhow!("[browse] local_storage origin: {e}"))?;
@@ -326,9 +336,10 @@ impl Policy {
 
     /// What agents may do, as (label, text) lines for `cred info`.
     pub fn rules(&self) -> Vec<(&'static str, String)> {
-        let consent = match self.agent.consent {
-            Consent::Session => "session (Touch ID on first use)",
-            Consent::None => "none",
+        let consent = match (self.agent.consent, self.agent.consent_minutes) {
+            (Consent::Session, 0) => "session (Touch ID on first use)".to_string(),
+            (Consent::Session, m) => format!("session (Touch ID on first use, then every {m} min)"),
+            (Consent::None, _) => "none".to_string(),
         };
         let mut lines = vec![("agent", format!("consent {consent}"))];
         if let Some(f) = &self.fetch {
@@ -348,6 +359,11 @@ impl Policy {
                 text += &format!(" (allowed: {})", b.allow_writes.join(", "));
             }
             text += if b.screenshots { "; screenshots" } else { "; no screenshots" };
+            if !b.fill.is_empty() {
+                text += &format!("; cred types {}", b.fill.join(", "));
+            }
+            let limit = |m: u64| if m == 0 { "none".to_string() } else { format!("{m} min") };
+            text += &format!("; closes when idle {}, at most {}", limit(b.idle_minutes), limit(b.max_minutes));
             lines.push(("browse", text));
         }
         lines
@@ -749,6 +765,7 @@ consent_minutes = 240  # a session consent lapses after this long (0: only when 
 # run = "~/.config/cred/refresh/RES.sh"     # prints a fresh value; gets the fields that
 #                                           # aren't exported as CRED_<FIELD>
 # from = "firefox:https://example.com#key"  # or: read it from Firefox Local Storage
+#                                           # (firefox-cookie:… and chrome-cookie:… read a cookie)
 
 # [fetch]
 # hosts = ["https://api.example.com"]
@@ -797,6 +814,7 @@ mod tests {
         start = "https://app.example.com/home"
         cookies = [{ name = "session", field = "token", domain = ".example.com" }]
         local_storage = [{ origin = "https://app.example.com", key = "jwt", field = "token" }]
+        fill = ["user", "password"]
     "#;
 
     #[test]
@@ -839,6 +857,8 @@ mod tests {
             ("[browse]\norigins = [\"https://a.example.com\"]\nallow_writes = [\"https://evil.com/x\"]", "allowed host"),
             ("[browse]\norigins = [\"https://*.com\"]", "like https://*.example.com"),
             ("[browse]\norigins = [\"ftp://*.example.com\"]", "like https://*.example.com"),
+            ("[browse]\norigins = [\"*\"]\nfill = [\"password\"]", "name the sites"),
+            ("[browse]\norigins = [\"https://a.example.com\"]\nfill = [\"_policy\"]", "fill '_policy'"),
         ];
         for (text, why) in bad {
             let err = format!("{:#}", Policy::parse(text).err().unwrap_or_else(|| panic!("accepted: {text}")));

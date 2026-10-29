@@ -366,6 +366,14 @@ fn cmd_info(res: &str) -> Result<()> {
             println!("{:<12}   auto-refresh: {how}", "");
         }
     }
+    let allowed = approved.as_ref().and_then(|a| a.policy.browse.as_ref()).map_or(&[][..], |b| &b.allow_writes[..]);
+    let writes = browse::blocked_writes(res, allowed);
+    if !writes.is_empty() {
+        println!("{:<12} writes pages tried without an allow_writes rule (add a URL prefix under [browse] to allow one):", "browser");
+        for (what, count, last) in writes {
+            println!("{:<12}   {what} (x{count}, last {last})", "");
+        }
+    }
     Ok(())
 }
 

@@ -50,6 +50,12 @@ pub fn get_silently(res: &str, field: &str) -> Option<String> {
     get(res, field)
 }
 
+/// A password another app keeps, e.g. Chrome's "Chrome Safe Storage". macOS asks the user
+/// before cred may read it.
+pub fn get_app_password(service: &str, account: &str) -> Result<Vec<u8>> {
+    Ok(get_generic_password(service, account)?)
+}
+
 /// Whether the item exists, without reading its value: only reading a value can make
 /// macOS ask for Keychain access, so status checks never prompt.
 pub fn exists(res: &str, field: &str) -> bool {

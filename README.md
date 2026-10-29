@@ -73,6 +73,7 @@ export = { token = "APP_TOKEN" }               # fields cred run exports, as env
 
 [refresh.session]
 from = "firefox:https://app.example.com#session_token"   # read from Firefox Local Storage
+                                               # (or firefox-cookie:… / chrome-cookie:… for a cookie)
 
 [refresh.token]
 run = "~/.config/cred/refresh/app.sh"          # prints a fresh value
@@ -99,7 +100,7 @@ request = "GET https://api.example.com/items/{id}"
 - `cred policy approve` prints the policy and pins its sha256, and each refresh script's, in the Keychain. If the policy or a script changes afterwards, or the approval wasn't written by cred, the resource is blocked until you approve again.
 - Refresh scripts get the fields that aren't exported (login, session) as `CRED_<FIELD>`. They run from a private copy of the approved bytes.
 - A field refreshes in the last 5 minutes before its exact expiry, on its expiry date if only the date is known, or daily if its expiry is unknown. This happens before `cred run` or an agent uses it, and during `cred check`. JWT values get their exact expiry from the token.
-- `from` handles logins only a browser can do (Google sign-in, other SSO): sign in on the site in Firefox, and cred reads the session it keeps. Firefox only for now (default profile; `CRED_FIREFOX_PROFILE` overrides).
+- `from` handles logins only a browser can do (Google sign-in, other SSO): sign in on the site in a browser, and cred reads the session it keeps. `firefox:ORIGIN#KEY` reads a Local Storage key, `firefox-cookie:ORIGIN#NAME` a cookie from Firefox (default profile; `CRED_FIREFOX_PROFILE` overrides), and `chrome-cookie:ORIGIN#NAME` a cookie from Chrome's Default profile (`CRED_CHROME_PROFILE` overrides). Chrome encrypts its cookies with a key kept in the Keychain as "Chrome Safe Storage", so macOS asks for your login password the first time cred reads it (Always Allow stops that).
 
 ## Agents
 
@@ -125,7 +126,12 @@ Each line carries an HMAC over its content and the previous line's, keyed by an 
 
 ## Browsing
 
-For sites an agent should use the way a person does, add a `[browse]` section. cred starts a headless Chromium (one per site, profile in memory only), puts the session into it from stored fields, and lets the agent steer it with `browse_open`, `browse_goto`, `browse_snapshot`, `browse_click`, `browse_type`, `browse_press`, `browse_back`, `browse_screenshot` (if the policy allows it) and `browse_close`. The agent gets the page's accessibility tree with element refs, masked. It never gets the login, cookies, storage, request headers, or a way to run JavaScript.
+For sites an agent should use the way a person does, add a `[browse]` section. cred starts a headless Chromium (one per site, profile in memory only), puts the session into it from stored fields, and lets the agent steer it with `browse_open`, `browse_goto`, `browse_snapshot`, `browse_find`, `browse_click`, `browse_type`, `browse_press`, `browse_back`, `browse_requests`, `browse_screenshot` (if the policy allows it), `browse_fill_credential` (if the policy lists fields) and `browse_close`. The agent gets the page's accessibility tree with element refs, masked. It never gets the login, cookies, storage, request headers, or a way to run JavaScript.
+
+- Pages can be large: `browse_snapshot` takes `compact` (one short line per named element) or `ref` (just that element), and `browse_find(text)` returns only the elements whose name or text match, with their refs.
+- After a click (or Enter), cred waits up to 3 seconds for the URL or the page's text to change, so single-page apps return the new view.
+- `browse_requests` lists the data requests (XHR/fetch: method and URL, never headers or bodies; query values over 16 characters left out) the pages made, so the agent can find the API behind a view and use `fetch` instead of scraping.
+- `browse_fill_credential(ref, field)` types a stored field into an input, for sites without a session to inject. cred does it itself, only for fields the policy lists in `fill`, and only when the page and the input's frame are on the policy's origins. The typed value is masked in everything returned.
 
 ```toml
 [browse]
@@ -133,6 +139,7 @@ origins = ["https://app.example.com"]          # the only sites pages may be ope
 requests = ["https://api.example.com"]         # further hosts the pages may call or load from
 writes = "ask"                                 # requests other than GET from pages: deny | ask | allow
 allow_writes = ["https://app.example.com/api/telemetry"]   # URL prefixes allowed without asking
+fill = ["user", "password"]                    # fields browse_fill_credential may type (not with origins = "*")
 start = "https://app.example.com/home"
 screenshots = true                             # let the agent see the page as an image (can't be masked)
 idle_minutes = 10                              # the browser closes after this long without a call (0: never)
@@ -142,6 +149,8 @@ local_storage = [{ origin = "https://app.example.com", key = "jwt", field = "tok
 ```
 
 Sites can be exact (`https://app.example.com`), a domain with its subdomains (`https://*.example.com`), or `"*"` for any https site. Requests to other hosts are blocked, service workers are off, and downloads are refused. Cookies only go to the domain the policy names. The runner (`runner/`, pinned `playwright-core`) is installed root-owned by `install.sh`; it uses Playwright's Chromium headless shell from `~/Library/Caches/ms-playwright`.
+
+Writes that pages try without an `allow_writes` rule (a telemetry POST on every page load, say) are blocked or asked about, and remembered without their query or body: `cred info SITE` lists them, so you can add the harmless ones to `allow_writes`. The page tools mention this when a write was blocked.
 
 A browser closes by itself after `idle_minutes` without a call, and `max_minutes` after it opened; the agent then needs `browse_open` again. A `browse_open` waits for your Touch ID when the site's first use in a session needs consent, so it can take as long as you take to answer.
 
