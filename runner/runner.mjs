@@ -20,6 +20,9 @@ const REQUEST_LIMIT = 100;
 const FIND_LIMIT = 50;
 // How long a snapshot waits for a download that is still being saved.
 const DOWNLOAD_WAIT = 120_000;
+// Downloads larger than this aren't copied to the Mac (Chromium's own copy, in the VM's memory,
+// is deleted).
+const DOWNLOAD_MAX = 512 * 1024 * 1024;
 let config, browser, context, page;
 // The newest storage state seen while a person signs in by hand (`config.login`): the window can
 // be closed before cred asks for it.
@@ -206,6 +209,13 @@ function onDownload(download) {
       return;
     }
     try {
+      const { size } = await stat(await download.path());
+      const max = config.downloadMax ?? DOWNLOAD_MAX;
+      if (size > max) {
+        await download.delete();
+        note(`blocked download ${name} (${size} bytes, more than ${max})`);
+        return;
+      }
       await mkdir(config.downloads, { recursive: true });
       const ext = path.extname(name);
       let target = path.join(config.downloads, name);

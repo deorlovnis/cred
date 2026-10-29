@@ -337,6 +337,17 @@ fn scenario() {
     assert!(page.contains("cookie: sid=visit2"), "the session goes back in: {page}");
     drop(again);
 
+    // A download over the limit isn't copied to the Mac.
+    let (mut capped, token) = Runner::start(&vm, "files");
+    let mut config = browse_config(&[&format!("https://{FILES_HOST}")], &format!("https://{FILES_HOST}/"));
+    config["downloads"] = json!("/downloads/capped");
+    config["downloadMax"] = json!(10);
+    let page = capped.open("files", &token, config).unwrap();
+    let after = capped.call(json!({ "cmd": "click", "ref": ref_of(&page, "Get the file") })).unwrap();
+    assert!(after.contains("blocked download _evil name.txt (19 bytes, more than 10)"), "{after}");
+    assert!(fs::read_dir(downloads.join("capped")).map_or(0, |d| d.count()) == 0, "nothing lands on the Mac");
+    drop(capped);
+
     // No downloads configured: the runner refuses them, and nothing lands on the Mac.
     let (mut refusing, token) = Runner::start(&vm, "files");
     let page = refusing.open("files", &token, browse_config(&[&format!("https://{FILES_HOST}")], &format!("https://{FILES_HOST}/"))).unwrap();
