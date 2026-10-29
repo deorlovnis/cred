@@ -8,8 +8,11 @@
 
 mod approve;
 mod audit;
+mod boxes;
 mod browse;
 mod browser;
+mod door;
+mod engine;
 mod fetch;
 mod index;
 mod keychain;
@@ -140,6 +143,79 @@ enum Cmd {
     Reseal {
         #[arg(value_parser = parse_resource)]
         resources: Vec<String>,
+    },
+    /// Boxes: isolated, encrypted places where an agent works, with cred as its only door
+    #[command(name = "box")]
+    Box {
+        #[command(subcommand)]
+        action: BoxCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum BoxCmd {
+    /// Make a box: edit its policy from a template, create its key and an empty encrypted store
+    New {
+        #[arg(value_parser = boxes::parse_name)]
+        name: String,
+    },
+    /// Open a box's policy in $EDITOR; shows what changed from the approved one
+    Edit {
+        #[arg(value_parser = boxes::parse_name)]
+        name: String,
+    },
+    /// Approve box policies with one Touch ID (all of them if none named); until then they have no effect
+    Approve {
+        #[arg(value_parser = boxes::parse_name)]
+        names: Vec<String>,
+    },
+    /// Open a box (Touch ID) and work in it; joins it if it runs already
+    #[command(after_help = "Without CMD, runs the policy's `run` (claude). --temp makes a throwaway box with the \
+                            same policy, shredded when it stops. Ctrl-C or closing the terminal stops the box.")]
+    Run {
+        /// A throwaway box: new store, key never written down, gone when it stops
+        #[arg(long)]
+        temp: bool,
+        #[arg(value_parser = boxes::parse_name)]
+        name: String,
+        #[arg(last = true, value_name = "CMD")]
+        command: Vec<String>,
+    },
+    /// List boxes: open or locked, policy status, size, sites, last used
+    #[command(visible_alias = "list")]
+    Ls,
+    /// Show what went through a box's door (Touch ID unless it is open)
+    Log {
+        #[arg(value_parser = boxes::parse_name)]
+        name: String,
+        /// How many of the latest lines to show
+        #[arg(short = 'n', long, default_value_t = 50)]
+        last: usize,
+    },
+    /// Stop a running box and lock it
+    Stop {
+        name: String,
+    },
+    /// Copy a file or folder out of a box (Touch ID); lists each file with its size and sha256
+    Export {
+        #[arg(value_parser = boxes::parse_name)]
+        name: String,
+        /// Path inside the box, e.g. work/report.md
+        path: String,
+        /// Folder on this Mac to copy it into
+        #[arg(long, value_name = "DIR")]
+        to: PathBuf,
+    },
+    /// Copy a file or folder into a box's work/ folder (box stopped)
+    Import {
+        #[arg(value_parser = boxes::parse_name)]
+        name: String,
+        path: String,
+    },
+    /// Delete a box for good: its key first, then its store (Touch ID)
+    Rm {
+        #[arg(value_parser = boxes::parse_name)]
+        name: String,
     },
 }
 
@@ -629,6 +705,18 @@ fn main() -> ExitCode {
         Cmd::Mcp => ok(mcp::serve()),
         Cmd::Audit { last, verify } => ok(audit::show(last, verify)),
         Cmd::Reseal { resources } => ok(cmd_reseal(resources)),
+        Cmd::Box { action } => match action {
+            BoxCmd::Run { temp, name, command } => boxes::run(&name, temp, command),
+            BoxCmd::New { name } => ok(boxes::new(&name)),
+            BoxCmd::Edit { name } => ok(boxes::edit(&name)),
+            BoxCmd::Approve { names } => ok(boxes::approve(&names)),
+            BoxCmd::Ls => ok(boxes::ls()),
+            BoxCmd::Log { name, last } => ok(boxes::log(&name, last)),
+            BoxCmd::Stop { name } => ok(boxes::stop(&name)),
+            BoxCmd::Export { name, path, to } => ok(boxes::export(&name, &path, &to)),
+            BoxCmd::Import { name, path } => ok(boxes::import(&name, &path)),
+            BoxCmd::Rm { name } => ok(boxes::rm(&name)),
+        },
     };
     match result {
         Ok(code) => ExitCode::from(code),

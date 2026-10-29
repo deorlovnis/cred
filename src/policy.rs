@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, IsTerminal};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{env, fs};
 
@@ -20,7 +20,7 @@ use similar::TextDiff;
 use url::{Host, Url};
 
 use crate::util::{config_dir, expand_home, sha256_hex};
-use crate::{approve, ask, browser, interactive, keychain, parse_env, parse_field, parse_resource};
+use crate::{approve, ask, boxes, browser, interactive, keychain, parse_env, parse_field, parse_resource};
 
 /// Keychain field of a resource's approval record. Field names can't start with "_".
 const APPROVAL: &str = "_policy";
@@ -197,14 +197,14 @@ pub struct BrowseStorage {
 
 /// A site the browser may use: an exact origin, "https://*.example.com" (that domain and its
 /// subdomains), or "*" (any https site).
-enum Site {
+pub enum Site {
     Any,
     Domain { scheme: String, domain: String },
     Exact(String),
 }
 
 impl Site {
-    fn parse(entry: &str) -> Result<Self> {
+    pub fn parse(entry: &str) -> Result<Self> {
         if entry == "*" {
             return Ok(Site::Any);
         }
@@ -219,7 +219,7 @@ impl Site {
     }
 
     /// The form the browser runner matches against.
-    fn text(&self) -> String {
+    pub fn text(&self) -> String {
         match self {
             Site::Any => "*".into(),
             Site::Domain { scheme, domain } => format!("{scheme}://*.{domain}"),
@@ -551,7 +551,7 @@ fn host_origin(entry: &str) -> Result<String> {
 // --- files and approval ---
 
 #[derive(Serialize, Deserialize)]
-struct Approval {
+pub struct Approval {
     /// sha256 of the policy file
     policy: String,
     /// refresh script path -> sha256
@@ -559,6 +559,18 @@ struct Approval {
     /// The approved text itself, so a later edit can be shown as a diff. Absent in older records.
     #[serde(default)]
     text: Option<String>,
+}
+
+impl Approval {
+    /// The approval of a policy file with this text and no scripts, like a box policy.
+    pub fn of(text: &str) -> Self {
+        Self { policy: sha256_hex(text.as_bytes()), scripts: BTreeMap::new(), text: Some(text.to_string()) }
+    }
+
+    /// The first characters of the file's sha256, for showing.
+    pub fn short(&self) -> &str {
+        &self.policy[..12]
+    }
 }
 
 /// A policy that is approved and unchanged since.
@@ -610,11 +622,27 @@ fn record(res: &str) -> Option<Approval> {
 }
 
 pub fn status(res: &str) -> Status {
-    let Ok(text) = fs::read(path(res)) else { return Status::Missing };
-    match record(res) {
+    status_of(res, &path(res))
+}
+
+/// The status of any approvable file (a resource's policy, a box's) whose approval record is
+/// kept under this Keychain name.
+pub fn status_of(key: &str, file: &Path) -> Status {
+    let Ok(text) = fs::read(file) else { return Status::Missing };
+    match record(key) {
         None => Status::Unapproved,
         Some(r) if r.policy == sha256_hex(&text) => Status::Approved,
         Some(_) => Status::Changed,
+    }
+}
+
+/// The text of an approvable file, as long as it is approved and unchanged since; otherwise why not.
+pub fn approved_at(key: &str, file: &Path) -> Result<String, Status> {
+    let text = fs::read_to_string(file).map_err(|_| Status::Missing)?;
+    match record(key) {
+        None => Err(Status::Unapproved),
+        Some(r) if r.policy == sha256_hex(text.as_bytes()) => Ok(text),
+        Some(_) => Err(Status::Changed),
     }
 }
 
@@ -644,13 +672,19 @@ impl Approved {
 }
 
 /// The policy text as it was approved, if the approval record keeps it.
-fn approved_text(res: &str) -> Option<String> {
-    record(res)?.text
+fn approved_text(key: &str) -> Option<String> {
+    record(key)?.text
 }
 
-/// Forget a resource's approval; its policy has no effect until approved again.
-pub fn revoke(res: &str) {
-    keychain::delete(res, APPROVAL);
+/// Forget an approval (a resource's, or a box's under its Keychain name); the file has no
+/// effect until approved again.
+pub fn revoke(key: &str) {
+    keychain::delete(key, APPROVAL);
+}
+
+/// How an approval reads in messages: a resource's name, or "box NAME".
+fn label(key: &str) -> String {
+    key.strip_prefix(boxes::KEY_PREFIX).map_or_else(|| key.to_string(), |name| format!("box {name}"))
 }
 
 /// Read, check and print a policy for approval; what is printed is exactly what gets pinned.
@@ -675,20 +709,36 @@ fn prepare(res: &str) -> Result<Approval> {
     Ok(Approval { policy: digest, scripts, text: Some(text) })
 }
 
-/// Approve the given resources' policies with one confirmation (all policies when none given).
+/// Approve the given resources' policies with one confirmation (all policies, boxes included,
+/// when none given).
 pub fn approve(resources: &[String]) -> Result<()> {
-    let resources = if resources.is_empty() { names() } else { resources.to_vec() };
+    let mut prepared = Vec::new();
     if resources.is_empty() {
+        for res in names() {
+            prepared.push((res.clone(), prepare(&res)?));
+        }
+        for name in boxes::names() {
+            prepared.push(boxes::prepare(&name)?);
+        }
+    } else {
+        for res in resources {
+            prepared.push((res.clone(), prepare(res)?));
+        }
+    }
+    if prepared.is_empty() {
         bail!("there are no policies (write one with: cred policy edit RESOURCE)");
     }
-    let prepared: Vec<(String, Approval)> =
-        resources.iter().map(|res| Ok((res.clone(), prepare(res)?))).collect::<Result<_>>()?;
-    let list: Vec<String> = prepared.iter().map(|(res, a)| format!("{res} (sha256 {})", &a.policy[..12])).collect();
+    approve_prepared(prepared)
+}
+
+/// Pin prepared approvals (Keychain name, record) after one confirmation.
+pub fn approve_prepared(prepared: Vec<(String, Approval)>) -> Result<()> {
+    let list: Vec<String> = prepared.iter().map(|(key, a)| format!("{} (sha256 {})", label(key), a.short())).collect();
     let what = if list.len() == 1 { "policy" } else { "policies" };
     approve::confirm(&format!("approve the cred {what} for {}", list.join(", ")))?;
-    for (res, approval) in prepared {
-        keychain::replace(&res, APPROVAL, &serde_json::to_string(&approval)?)?;
-        println!("approved the policy for {res}");
+    for (key, approval) in prepared {
+        keychain::replace(&key, APPROVAL, &serde_json::to_string(&approval)?)?;
+        println!("approved the policy for {}", label(&key));
     }
     Ok(())
 }
@@ -729,24 +779,37 @@ pub fn edit(res: &str) -> Result<()> {
         fs::create_dir_all(dir())?;
         fs::write(&p, TEMPLATE.replace("RES", res))?;
     }
+    if edit_file(res, &p, |text| Policy::parse(text).map(drop))? {
+        offer_approval(&p, &format!("cred policy approve {res}"), || approve(&[res.to_string()]))?;
+    }
+    Ok(())
+}
+
+/// Open an approvable file in $EDITOR and check what was saved. A file approved before shows
+/// what the edit changed (false if nothing); a new one is shown whole when approved.
+pub fn edit_file(key: &str, p: &Path, check: impl FnOnce(&str) -> Result<()>) -> Result<bool> {
     let editor = env::var("VISUAL").or_else(|_| env::var("EDITOR")).unwrap_or_else(|_| "vi".into());
-    let status = Command::new("sh").args(["-c", &format!("{editor} \"$1\""), "sh"]).arg(&p).status()?;
+    let status = Command::new("sh").args(["-c", &format!("{editor} \"$1\""), "sh"]).arg(p).status()?;
     if !status.success() {
         bail!("{editor} exited with {status}");
     }
-    let text = fs::read_to_string(&p)?;
-    Policy::parse(&text).with_context(|| p.display().to_string())?;
-    // A policy approved before shows what the edit changes; a new one is shown whole when approved.
-    if let Some(old) = approved_text(res) {
+    let text = fs::read_to_string(p)?;
+    check(&text).with_context(|| p.display().to_string())?;
+    if let Some(old) = approved_text(key) {
         if old == text {
-            println!("no change from the approved policy for {res}");
-            return Ok(());
+            println!("no change from the approved policy for {}", label(key));
+            return Ok(false);
         }
         println!("{}", diff(&old, &text, io::stdout().is_terminal()));
     }
-    println!("saved {} — it takes effect once approved: cred policy approve {res}", p.display());
+    Ok(true)
+}
+
+/// Say that an edited file takes effect once approved, and offer to approve it now.
+pub fn offer_approval(p: &Path, approve_cmd: &str, approve_now: impl FnOnce() -> Result<()>) -> Result<()> {
+    println!("saved {} — it takes effect once approved: {approve_cmd}", p.display());
     if interactive() && ask("Approve it now? [y/N] ")?.eq_ignore_ascii_case("y") {
-        approve(&[res.to_string()])?;
+        approve_now()?;
     }
     Ok(())
 }
