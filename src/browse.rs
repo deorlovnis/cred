@@ -3,15 +3,24 @@
 //! it (cookies and Local Storage from stored fields), hands it the site's rules, and answers
 //! its questions about writes with Touch ID. The agent only gets page text, masked.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::fs;
 
 use anyhow::{Context, Result, anyhow, bail};
+use jiff::civil::Date;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::index::today;
 use crate::policy::{Approved, Mode};
+use crate::util::config_dir;
 use crate::{approve, keychain};
+
+/// Writes a site's pages tried without an `allow_writes` rule are remembered, up to this many per site.
+const BLOCKED_LIMIT: usize = 50;
 
 /// Where install.sh puts the runner, owned by root so nothing running as the user can change it.
 const RUNNER_DIR: &str = "/usr/local/lib/cred/runner";
@@ -104,6 +113,10 @@ impl Session {
                 bail!("the browser runner stopped");
             }
             let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+            if let Some(write) = msg.get("write") {
+                record_write(&self.site, write["method"].as_str().unwrap_or("?"), write["url"].as_str().unwrap_or(""));
+                continue;
+            }
             if let Some(ask) = msg.get("ask") {
                 let method = msg["method"].as_str().unwrap_or("?");
                 let url = msg["url"].as_str().unwrap_or("?");
@@ -123,6 +136,17 @@ impl Session {
     }
 }
 
+/// The command that types one of the site's stored fields into a page, as far as the approved
+/// policy lets cred. The runner only types it on the policy's own origins.
+pub fn fill_command(site: &str, approved: &Approved, element: &str, field: &str) -> Result<Value> {
+    let allowed = approved.policy.browse.as_ref().is_some_and(|b| b.fill.iter().any(|f| f == field));
+    if !allowed {
+        bail!("the policy for {site} doesn't let cred type {field} into pages (list it in [browse] fill)");
+    }
+    let value = keychain::get(site, field).ok_or_else(|| anyhow!("{site}/{field} isn't stored"))?;
+    Ok(json!({ "cmd": "fill", "ref": element, "value": value }))
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         let _ = writeln!(self.stdin, "{}", json!({ "id": 0, "cmd": "close" }));
@@ -136,5 +160,92 @@ impl Drop for Session {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// A write that pages tried, kept so `cred info` can show what to put in `allow_writes`.
+#[derive(Serialize, Deserialize)]
+struct WriteSeen {
+    count: u32,
+    last: Date,
+}
+
+fn blocked_path(site: &str) -> PathBuf {
+    config_dir().join("blocked-writes").join(format!("{site}.json"))
+}
+
+/// Remember a write a page tried (method and URL without query, never a body). Best effort.
+fn record_write(site: &str, method: &str, url: &str) {
+    let Ok(mut url) = url::Url::parse(url) else { return };
+    url.set_query(None);
+    url.set_fragment(None);
+    let _ = remember(&blocked_path(site), &format!("{method} {url}"));
+}
+
+fn remember(path: &Path, entry: &str) -> Result<()> {
+    let mut seen = read_seen(path);
+    if seen.len() >= BLOCKED_LIMIT && !seen.contains_key(entry) {
+        return Ok(());
+    }
+    let item = seen.entry(entry.to_string()).or_insert(WriteSeen { count: 0, last: today() });
+    (item.count, item.last) = (item.count + 1, today());
+    fs::create_dir_all(path.parent().context("no folder")?)?;
+    fs::write(path, serde_json::to_string(&seen)?)?;
+    Ok(())
+}
+
+fn read_seen(path: &Path) -> BTreeMap<String, WriteSeen> {
+    fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+/// Writes the site's pages tried that its policy doesn't allow outright: "METHOD URL", how
+/// often, and when last.
+pub fn blocked_writes(site: &str, allow_writes: &[String]) -> Vec<(String, u32, Date)> {
+    list_writes(&blocked_path(site), allow_writes)
+}
+
+fn list_writes(path: &Path, allow_writes: &[String]) -> Vec<(String, u32, Date)> {
+    read_seen(path)
+        .into_iter()
+        .filter(|(entry, _)| {
+            let url = entry.split_once(' ').map_or("", |(_, u)| u);
+            !allow_writes.iter().any(|prefix| url.starts_with(prefix.as_str()))
+        })
+        .map(|(entry, seen)| (entry, seen.count, seen.last))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::TempDir;
+
+    #[test]
+    fn remembers_writes_and_hides_allowed_ones() {
+        let dir = TempDir::new("cred-test").unwrap();
+        let path = dir.0.join("blocked-writes/app.json");
+        let telemetry = "POST https://app.example.com/api/telemetry";
+        for entry in [telemetry, telemetry, "DELETE https://app.example.com/api/items/1"] {
+            remember(&path, entry).unwrap();
+        }
+        let all = list_writes(&path, &[]);
+        assert_eq!(all.len(), 2);
+        assert_eq!((all[1].0.as_str(), all[1].1), (telemetry, 2));
+        let rest = list_writes(&path, &["https://app.example.com/api/telemetry".to_string()]);
+        assert_eq!(rest.len(), 1);
+        assert!(rest[0].0.starts_with("DELETE"));
+        assert!(list_writes(&dir.0.join("none.json"), &[]).is_empty());
+    }
+
+    #[test]
+    fn stops_remembering_new_writes_at_the_limit() {
+        let dir = TempDir::new("cred-test").unwrap();
+        let path = dir.0.join("app.json");
+        for i in 0..BLOCKED_LIMIT + 5 {
+            remember(&path, &format!("POST https://app.example.com/{i}")).unwrap();
+        }
+        assert_eq!(read_seen(&path).len(), BLOCKED_LIMIT);
+        remember(&path, "POST https://app.example.com/0").unwrap();
+        assert_eq!(read_seen(&path)["POST https://app.example.com/0"].count, 2);
     }
 }

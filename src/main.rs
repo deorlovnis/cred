@@ -7,11 +7,13 @@
 //! Agents never get the credentials themselves.
 
 mod approve;
+mod audit;
 mod browse;
 mod browser;
 mod fetch;
 mod index;
 mod keychain;
+mod limits;
 mod mask;
 mod mcp;
 mod policy;
@@ -125,6 +127,15 @@ enum Cmd {
     },
     /// Serve agents over MCP (stdio): requests and site tools, credentials added by cred
     Mcp,
+    /// Show what agents did through `cred mcp` (never values); --verify checks nothing was altered
+    Audit {
+        /// How many of the latest entries to show
+        #[arg(short = 'n', long, default_value_t = 20)]
+        last: usize,
+        /// Check the whole log against its Keychain-held HMAC chain
+        #[arg(long)]
+        verify: bool,
+    },
     /// Re-create Keychain items so only the running cred may read them (after re-signing cred)
     Reseal {
         #[arg(value_parser = parse_resource)]
@@ -325,7 +336,20 @@ fn cmd_info(res: &str) -> Result<()> {
     println!("{:<12} {res}", "name");
     println!("{:<12} {}", "url", r.url);
     println!("{:<12} {}", "description", r.description);
-    println!("{:<12} {} ({})", "policy", policy::status(res).text(), policy::path(res).display());
+    let status = policy::status(res);
+    println!("{:<12} {} ({})", "policy", status.text(), policy::path(res).display());
+    match &approved {
+        // Lines about what agents may do. Further ones (e.g. blocked browser writes) go here.
+        Some(a) => {
+            for (label, text) in a.policy.rules() {
+                println!("  {label:<10} {text}");
+            }
+        }
+        None if !matches!(status, policy::Status::Missing) => {
+            println!("  nothing in it applies until approved (cred policy approve {res})");
+        }
+        None => {}
+    }
     for (name, f) in &r.fields {
         let mut parts = vec![if keychain::exists(res, name) { "stored" } else { "MISSING" }.to_string()];
         let export = approved.as_ref().and_then(|a| a.policy.run.export.get(name));
@@ -340,6 +364,14 @@ fn cmd_info(res: &str) -> Result<()> {
         if let Some(r) = approved.as_ref().and_then(|a| a.policy.refresh.get(name)) {
             let how = r.from.as_ref().map_or_else(|| format!("run {}", r.run.as_deref().unwrap_or("")), |f| format!("from {f}"));
             println!("{:<12}   auto-refresh: {how}", "");
+        }
+    }
+    let allowed = approved.as_ref().and_then(|a| a.policy.browse.as_ref()).map_or(&[][..], |b| &b.allow_writes[..]);
+    let writes = browse::blocked_writes(res, allowed);
+    if !writes.is_empty() {
+        println!("{:<12} writes pages tried without an allow_writes rule (add a URL prefix under [browse] to allow one):", "browser");
+        for (what, count, last) in writes {
+            println!("{:<12}   {what} (x{count}, last {last})", "");
         }
     }
     Ok(())
@@ -366,7 +398,7 @@ fn field_status(res: &str, name: &str, f: &Field, auto: bool, warn: i64) -> (i64
 fn cmd_ls() -> Result<()> {
     let idx = Index::load()?;
     let warn = warn_days();
-    println!("{:<20} {:<9} {:<17} {:<34} DESCRIPTION", "RESOURCE", "STATUS", "EXPIRES", "FIELDS");
+    println!("{:<20} {:<9} {:<17} {:<34} {:<26} DESCRIPTION", "RESOURCE", "STATUS", "EXPIRES", "FIELDS", "POLICY");
     for (res, r) in &idx.map {
         let approved = policy::load(res).ok();
         let auto = |n: &str| approved.as_ref().is_some_and(|a| a.policy.refresh.contains_key(n));
@@ -390,7 +422,11 @@ fn cmd_ls() -> Result<()> {
                 None => n.clone(),
             })
             .collect();
-        println!("{res:<20} {status:<9} {expires:<17} {:<34} {}", fields.join(", "), r.description);
+        let policy = match &approved {
+            Some(a) => a.policy.summary(),
+            None => policy::status(res).text().to_string(),
+        };
+        println!("{res:<20} {status:<9} {expires:<17} {:<34} {policy:<26} {}", fields.join(", "), r.description);
     }
     Ok(())
 }
@@ -591,6 +627,7 @@ fn main() -> ExitCode {
         Cmd::Copy { resource, field } => ok(cmd_copy(&resource, &field)),
         Cmd::Run { resources, command } => cmd_run(resources, command),
         Cmd::Mcp => ok(mcp::serve()),
+        Cmd::Audit { last, verify } => ok(audit::show(last, verify)),
         Cmd::Reseal { resources } => ok(cmd_reseal(resources)),
     };
     match result {

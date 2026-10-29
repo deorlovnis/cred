@@ -39,21 +39,19 @@ key would need one Keychain prompt after every update.
 
 ## 3. Audit log and idle timeouts in boxes
 
-`cred mcp` on the host has both (branch `integrate-todo`). Boxes still need them: the smart
+`cred mcp` on the host has both. Boxes still need them: the smart
 door's log (design phase 2), and `idle` and `max` limits, lock when the screen locks or the Mac
 sleeps (design phase 4).
 
 ## 4. Review and verify (agent work from 2026-10-29)
 
-Done on branch `integrate-todo` (worktree `../cred-integrate`), not yet on `main`: audit log and
+Merged to `main` on 2026-10-29: audit log and
 `cred audit`, consent and browser time limits, `info`/`ls` policy rules, the `policy edit` diff,
 repo e2e tests, SPA click waits, compact/ref snapshots, `browse_find`, `browse_requests`,
 blocked writes in `cred info`, `browse_fill_credential`, Firefox and Chrome cookie sources.
 Build, clippy and tests are clean (33 unit, 10 e2e, plus the browser e2e); none of it has run
 against the real Keychain.
 
-- Review the branch and merge it to `main` (the TODO there drops the items above; take this
-  file's version).
 - Run `mise run e2e-opt-in` once: it needs one Touch ID for a throwaway `e2e-touchid-*` resource
   and should remove it afterwards; check no `cred:e2e-touchid-*` item is left.
 - Audit log: the key `cred:_audit/hmac` is made on the first audited call; check that it is
