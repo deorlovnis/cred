@@ -32,6 +32,18 @@ sudo cp -R runner/runner.mjs runner/package.json runner/package-lock.json runner
 sudo chown -R root:wheel "$runner"
 echo "installed $runner"
 
+# The image of the agent VM for boxes, built with Apple's container. Only boxes need it, so a
+# missing or stopped container is a note, not a failure.
+if ! command -v container >/dev/null 2>&1; then
+  echo "note: Apple's container isn't installed, so boxes won't run: https://github.com/apple/container/releases" >&2
+elif ! container system status >/dev/null 2>&1; then
+  echo "note: container's system isn't running; run 'container system start', then install.sh again to build the agent image" >&2
+elif container build -f box/agent.Containerfile -t cred-agent box; then
+  echo "built the agent image cred-agent"
+else
+  echo "warning: building the agent image failed; boxes won't run until 'container build' of box/agent.Containerfile works" >&2
+fi
+
 # Keychain items are tied to the build that wrote them, so a new cred can't read the old
 # approvals silently: approve the policies again, with one Touch ID for all of them.
 if [ -n "$(ls "$HOME/.config/cred/policy/"*.toml 2>/dev/null)" ]; then

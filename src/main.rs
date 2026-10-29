@@ -12,6 +12,7 @@ mod browse;
 mod browser;
 #[allow(dead_code)] // until `cred box` uses the door
 mod door;
+mod engine;
 mod fetch;
 mod index;
 mod keychain;

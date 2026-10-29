@@ -16,6 +16,8 @@ cred --help
 
 To update: `git pull && ./install.sh`. It ends by asking you to approve your policies again, with one Touch ID (see Signing). Never install a debug build: debug builds let tests answer approval prompts.
 
+Boxes (in progress) run agents in VMs made by Apple's [`container`](https://github.com/apple/container/releases) (macOS 26). If it's installed and running (`container system start`), `install.sh` also builds the agent image from `box/agent.Containerfile`; without it the rest of cred works as before. `mise run e2e-box` tests the VM engine against a real VM.
+
 ### Signing
 
 macOS asks before an app reads a Keychain item it didn't store, and remembers **Always Allow** per app identity. A plain Rust build is ad-hoc signed, so every rebuild counts as a new app and asks again. Sign with a stable self-signed identity once, and your Always Allow answers survive updates:
