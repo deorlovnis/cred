@@ -7,6 +7,7 @@
 //! Agents never get the credentials themselves.
 
 mod approve;
+mod browse;
 mod browser;
 mod fetch;
 mod index;

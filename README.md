@@ -107,6 +107,23 @@ The agent gets these tools:
 
 Results are masked: the resource's values, and anything shaped like a JWT. Writes follow the policy's `writes` rule. When the policy asks for consent, a site's first use in a session needs your Touch ID.
 
+## Browsing
+
+For sites an agent should use the way a person does, add a `[browse]` section. cred starts a headless Chromium (one per site, profile in memory only), puts the session into it from stored fields, and lets the agent steer it with `browse_open`, `browse_goto`, `browse_snapshot`, `browse_click`, `browse_type`, `browse_press`, `browse_back` and `browse_close`. The agent gets the page's accessibility tree with element refs, masked. It never gets the login, cookies, storage, request headers, or a way to run JavaScript.
+
+```toml
+[browse]
+origins = ["https://app.example.com"]          # the only sites pages may be opened from
+requests = ["https://api.example.com"]         # further hosts the pages may call or load from
+writes = "ask"                                 # requests other than GET from pages: deny | ask | allow
+allow_writes = ["https://app.example.com/api/telemetry"]   # URL prefixes allowed without asking
+start = "https://app.example.com/home"
+cookies = [{ name = "session", field = "token", domain = ".example.com" }]
+local_storage = [{ origin = "https://app.example.com", key = "jwt", field = "token" }]
+```
+
+Requests to other hosts are blocked, service workers are off, and downloads are refused. The runner (`runner/`, pinned `playwright-core`) is installed root-owned by `install.sh`.
+
 ## With Claude Code
 
 Deny direct Keychain and clipboard reads in `~/.claude/settings.json` too:

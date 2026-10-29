@@ -1,6 +1,6 @@
 #!/bin/sh
-# Build, sign and install cred as /usr/local/bin/cred, owned by root so nothing running as you
-# can replace it.
+# Build, sign and install cred as /usr/local/bin/cred, and its browser runner in
+# /usr/local/lib/cred/runner, owned by root so nothing running as you can replace them.
 #
 # The signing key asks before every signing: choose "Allow", never "Always Allow". Otherwise
 # any program running as you could sign a lookalike cred that the Keychain trusts. Without the
@@ -21,3 +21,13 @@ echo "Installing $dest (sudo asks for your password)."
 sudo install -d -o root -g wheel -m 755 "$(dirname "$dest")"
 sudo install -o root -g wheel -m 755 target/release/cred "$dest"
 echo "installed $dest"
+
+# The browser runner (cred's sandboxed browsing), with its pinned playwright-core, root-owned too.
+runner=/usr/local/lib/cred/runner
+(cd runner && npm ci --ignore-scripts --no-audit --no-fund --silent)
+node runner/node_modules/playwright-core/cli.js install chromium-headless-shell >/dev/null
+sudo rm -rf "$runner"
+sudo install -d -o root -g wheel -m 755 "$runner"
+sudo cp -R runner/runner.mjs runner/package.json runner/package-lock.json runner/node_modules "$runner/"
+sudo chown -R root:wheel "$runner"
+echo "installed $runner"

@@ -1,0 +1,9 @@
+{
+  "name": "cred-browser-runner",
+  "private": true,
+  "type": "module",
+  "description": "Drives one headless Chromium for cred's sandboxed browsing",
+  "dependencies": {
+    "playwright-core": "1.63.0"
+  }
+}

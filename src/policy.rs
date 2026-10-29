@@ -38,6 +38,7 @@ pub struct Policy {
     pub fetch: Option<Fetch>,
     #[serde(default, rename = "tool")]
     pub tools: Vec<Tool>,
+    pub browse: Option<Browse>,
 }
 
 /// What `cred run` may do.
@@ -106,6 +107,99 @@ fn default_auth_header() -> String {
     "Authorization".into()
 }
 
+/// The sandboxed browser an agent may steer: which pages it may open, where those pages may
+/// send requests, and the session cred puts into it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Browse {
+    /// The only sites pages may be opened from.
+    pub origins: Vec<String>,
+    /// Further hosts the pages may load from or call (APIs, static files).
+    #[serde(default)]
+    pub requests: Vec<String>,
+    /// Requests other than GET/HEAD/OPTIONS that pages send.
+    #[serde(default)]
+    pub writes: Mode,
+    /// URL prefixes that may receive writes without asking.
+    #[serde(default)]
+    pub allow_writes: Vec<String>,
+    /// The page opened first.
+    pub start: Option<String>,
+    #[serde(default)]
+    pub cookies: Vec<BrowseCookie>,
+    #[serde(default)]
+    pub local_storage: Vec<BrowseStorage>,
+}
+
+/// A cookie set from a stored field, e.g. the session token.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowseCookie {
+    pub name: String,
+    pub field: String,
+    pub domain: String,
+}
+
+/// A Local Storage entry set from a stored field, on one origin.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowseStorage {
+    pub origin: String,
+    pub key: String,
+    pub field: String,
+}
+
+impl Browse {
+    pub fn origins(&self) -> Vec<String> {
+        self.origins.iter().filter_map(|h| host_origin(h).ok()).collect()
+    }
+
+    pub fn requests(&self) -> Vec<String> {
+        self.requests.iter().filter_map(|h| host_origin(h).ok()).collect()
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.origins.is_empty() {
+            bail!("[browse] origins is empty");
+        }
+        for host in self.origins.iter().chain(&self.requests) {
+            host_origin(host).map_err(|e| anyhow!("[browse] '{host}': {e}"))?;
+        }
+        let (origins, all) = (self.origins(), [self.origins(), self.requests()].concat());
+        let origin_of = |raw: &str| Url::parse(raw).map_err(|e| anyhow!("{e}")).and_then(|u| url_origin(&u));
+        for prefix in &self.allow_writes {
+            if !all.contains(&origin_of(prefix).map_err(|e| anyhow!("[browse] allow_writes '{prefix}': {e}"))?) {
+                bail!("[browse] allow_writes '{prefix}' isn't on an allowed host");
+            }
+        }
+        if let Some(start) = &self.start
+            && !origins.contains(&origin_of(start).map_err(|e| anyhow!("[browse] start: {e}"))?)
+        {
+            bail!("[browse] start must be on one of the origins");
+        }
+        let hosts: Vec<String> = origins.iter().filter_map(|o| Url::parse(o).ok()?.host_str().map(str::to_string)).collect();
+        for c in &self.cookies {
+            parse_field(&c.field).map_err(|e| anyhow!("[browse] cookie {}: field: {e}", c.name))?;
+            if c.name.is_empty() || !c.name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
+                bail!("[browse] cookie name '{}' isn't valid", c.name);
+            }
+            // The cookie may only be as wide as the sites the browser may open.
+            let domain = c.domain.trim_start_matches('.');
+            let fits = domain.contains('.') && hosts.iter().any(|h| h == domain || h.ends_with(&format!(".{domain}")));
+            if !fits {
+                bail!("[browse] cookie {} domain '{}' doesn't cover one of the origins", c.name, c.domain);
+            }
+        }
+        for s in &self.local_storage {
+            parse_field(&s.field).map_err(|e| anyhow!("[browse] local_storage {}: field: {e}", s.key))?;
+            if !origins.contains(&host_origin(&s.origin).map_err(|e| anyhow!("[browse] local_storage origin: {e}"))?) {
+                bail!("[browse] local_storage origin '{}' isn't one of the origins", s.origin);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A named request an agent may make: "METHOD URL", {placeholders} only in the path or query.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -166,6 +260,9 @@ impl Policy {
                     bail!("[fetch] headers: '{name}' can't be set here");
                 }
             }
+        }
+        if let Some(browse) = &self.browse {
+            browse.validate()?;
         }
         let mut names = BTreeSet::new();
         for tool in &self.tools {
@@ -492,6 +589,15 @@ mod tests {
         name = "item"
         about = "Get one item"
         request = "GET https://api.example.com/items/{id}?q={query}"
+
+        [browse]
+        origins = ["https://app.example.com"]
+        requests = ["https://api.example.com"]
+        writes = "ask"
+        allow_writes = ["https://app.example.com/api/telemetry"]
+        start = "https://app.example.com/home"
+        cookies = [{ name = "session", field = "token", domain = ".example.com" }]
+        local_storage = [{ origin = "https://app.example.com", key = "jwt", field = "token" }]
     "#;
 
     #[test]
@@ -518,6 +624,10 @@ mod tests {
             ("[fetch]\nhosts = [\"https://a.example.com\"]\nheaders = { authorization = \"x\" }", "can't be set"),
             ("[fetch]\nhosts = [\"https://a.example.com\"]\nheaders = { x-id = \"{token}\" }", "can't be set"),
             ("[fetch]\nhosts = [\"https://a.example.com\"]\nheaders = { cookie = \"a=b\" }", "can't be set"),
+            ("[browse]\norigins = [\"https://a.example.com\"]\ncookies = [{ name = \"s\", field = \"token\", domain = \".com\" }]", "doesn't cover"),
+            ("[browse]\norigins = [\"https://a.example.com\"]\ncookies = [{ name = \"s\", field = \"token\", domain = \"other.com\" }]", "doesn't cover"),
+            ("[browse]\norigins = [\"https://a.example.com\"]\nstart = \"https://b.example.com/\"", "start"),
+            ("[browse]\norigins = [\"https://a.example.com\"]\nallow_writes = [\"https://evil.com/x\"]", "allowed host"),
         ];
         for (text, why) in bad {
             let err = format!("{:#}", Policy::parse(text).err().unwrap_or_else(|| panic!("accepted: {text}")));
