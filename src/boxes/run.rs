@@ -11,9 +11,12 @@
 
 use std::any::Any;
 use std::fs;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -23,7 +26,7 @@ use serde_json::{Map, Value, json};
 
 use super::store::{self, Layout};
 use super::{BoxPolicy, MountPolicy, mount_problem};
-use crate::{approve, door, engine, keychain, policy};
+use crate::{approve, door, engine, keychain, policy, seal};
 
 /// Where the store's folders appear in the VM, and where `ro` folders go.
 const GUEST_HOME: &str = "/home/agent";
@@ -43,6 +46,8 @@ pub trait World: Sync {
     fn stop_vm(&self, vm: &str);
     /// Start the door. It stops when the returned value is dropped.
     fn start_door(&self, cfg: door::Config) -> Result<Box<dyn Any>>;
+    /// Make the box's CA trusted inside the VM (as root, before the agent starts).
+    fn install_ca(&self, vm: &str, pem: &str) -> Result<()>;
     fn model_uses_bearer(&self, model: &str) -> Result<bool>;
     /// Fails unless the site has an approved policy.
     fn site_ready(&self, site: &str) -> Result<()>;
@@ -79,6 +84,10 @@ impl World for Real {
 
     fn start_door(&self, cfg: door::Config) -> Result<Box<dyn Any>> {
         Ok(Box::new(door::Door::start(cfg)?))
+    }
+
+    fn install_ca(&self, vm: &str, pem: &str) -> Result<()> {
+        engine::install_ca(vm, pem)
     }
 
     fn model_uses_bearer(&self, model: &str) -> Result<bool> {
@@ -173,6 +182,7 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
     if !req.persistent {
         store.shred_on_close();
     }
+    let ca = Arc::new(box_ca(&mnt, req.name, &key, req.persistent)?);
     let _ = store::log_event(&mnt, "box", &req.id, 0, "started");
 
     // The folders are changed here, while no VM has them.
@@ -208,6 +218,7 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
         model: policy.model.clone(),
         sites: policy.sites.clone(),
         log: store::door_log(&mnt),
+        ca: Some(ca.clone()),
     };
 
     // Declared in the order they start, so they drop in the order they must end: VM, door, store.
@@ -215,6 +226,7 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
     let vm_guard = VmGuard { world, vm: &vm, socket: &socket };
     world.start_vm(&spec)?;
     door = world.start_door(config)?;
+    world.install_ca(&vm, &ca.cert_pem())?;
 
     let done = AtomicBool::new(false);
     let status = thread::scope(|scope| {
@@ -254,6 +266,30 @@ impl Drop for VmGuard<'_> {
     fn drop(&mut self) {
         self.world.stop_vm(self.vm);
         let _ = fs::remove_file(self.socket);
+    }
+}
+
+/// The box's CA, which only its VM trusts. A kept box has it sealed in its store (with a key
+/// derived from the box key), made on the first run that needs it, so a box from before the door
+/// ended TLS gets one too. A box that isn't kept gets one for this run, in memory only.
+fn box_ca(mnt: &Path, name: &str, box_key: &str, persistent: bool) -> Result<door::BoxCa> {
+    if !persistent {
+        return door::BoxCa::generate(name);
+    }
+    let key = seal::derive(box_key.as_bytes(), door::CA_PURPOSE);
+    let file = store::ca_file(mnt);
+    match fs::read(&file) {
+        Ok(sealed) => door::BoxCa::from_sealed(&sealed, &key).with_context(|| format!("box {name}'s CA ({})", file.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let ca = door::BoxCa::generate(name)?;
+            let tmp = file.with_extension("new");
+            let mut out = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+            out.write_all(&ca.to_sealed(&key)?)?;
+            out.sync_all()?;
+            fs::rename(&tmp, &file).with_context(|| format!("saving {}", file.display()))?;
+            Ok(ca)
+        }
+        Err(e) => Err(e).with_context(|| format!("reading {}", file.display())),
     }
 }
 
@@ -405,6 +441,9 @@ mod tests {
         calls: Vec<String>,
         spec: Option<SpecSeen>,
         door: Option<DoorSeen>,
+        /// The CA installed in the VM, as PEM, and whether the door was given one.
+        ca: Option<String>,
+        door_ca: Option<String>,
         exec: Option<ExecSeen>,
         /// Files of the box as the agent would find them, read when it starts.
         files: BTreeMap<String, String>,
@@ -472,8 +511,15 @@ mod tests {
             if self.door_fails {
                 bail!("the door can't start");
             }
+            self.seen.lock().unwrap().door_ca = cfg.ca.as_ref().map(|ca| ca.cert_pem());
             self.seen.lock().unwrap().door = Some((cfg.allow, cfg.model, cfg.sites, cfg.log));
             Ok(Box::new(()))
+        }
+
+        fn install_ca(&self, _vm: &str, pem: &str) -> Result<()> {
+            self.note("install_ca");
+            self.seen.lock().unwrap().ca = Some(pem.to_string());
+            Ok(())
         }
 
         fn model_uses_bearer(&self, model: &str) -> Result<bool> {
@@ -586,7 +632,7 @@ mod tests {
         assert_eq!(code, 0);
         assert_eq!(
             fake.calls(),
-            ["available", "bearer: anthropic", "site: anthropic", "site: github", "confirm: open box r and let it use github", "start_vm", "start_door", "exec", "stop_vm"]
+            ["available", "bearer: anthropic", "site: anthropic", "site: github", "confirm: open box r and let it use github", "start_vm", "start_door", "install_ca", "exec", "stop_vm"]
         );
         assert_put_away(&s);
         assert!(!stale.exists(), "leftovers of crashed runs are cleared");
@@ -604,6 +650,12 @@ mod tests {
 
         let (env, cmd, tty) = seen.exec.clone().unwrap();
         assert!(env.contains(&("CLAUDE_CODE_OAUTH_TOKEN".into(), "cred-managed".into())), "the bearer stand-in: {env:?}");
+        let pem = seen.ca.clone().expect("the CA is installed in the VM");
+        assert!(pem.starts_with("-----BEGIN CERTIFICATE-----") && !pem.contains("PRIVATE"), "{pem}");
+        assert_eq!(seen.door_ca.as_deref(), Some(pem.as_str()), "the door ends TLS with the CA the VM trusts");
+        for var in ["NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "PIP_CERT", "GIT_SSL_CAINFO"] {
+            assert!(env.iter().any(|(k, v)| k == var && v.starts_with("/")), "{var} in {env:?}");
+        }
         assert_eq!(&cmd[..2], ["sh", "-c"]);
         assert!(cmd[2].starts_with("cd /work && exec"), "{}", cmd[2]);
         assert_eq!(&cmd[3..], ["bash", "-l"]);
@@ -735,6 +787,58 @@ mod tests {
         run(&s.layout, &fake, &Request { id: id.clone(), unique: true, ..request(&s, &p, false) }).unwrap();
         assert_eq!(fake.seen.lock().unwrap().spec.as_ref().unwrap().0, "cred-box-r-tmp-0a1b2c3d");
         assert!(!s.layout.ephemeral_bundle(&id).exists() && !s.layout.lock(&id).exists());
+    }
+
+    #[test]
+    fn a_temporary_box_keeps_its_ca_in_memory_only() {
+        let s = setup();
+        let p = policy(&s, "");
+        let hook: Hook = Box::new(|work| {
+            let mnt = work.parent().unwrap();
+            assert!(!mnt.join("door/ca.sealed").exists(), "nothing is written for a box that isn't kept");
+        });
+        let first = Fake { hook: Some(hook), ..Fake::default() };
+        run(&s.layout, &first, &request(&s, &p, false)).unwrap();
+        let second = Fake::default();
+        run(&s.layout, &second, &request(&s, &p, false)).unwrap();
+        let (a, b) = (first.seen.lock().unwrap().ca.clone().unwrap(), second.seen.lock().unwrap().ca.clone().unwrap());
+        assert_ne!(a, b, "every temporary box has a CA of its own");
+    }
+
+    #[test]
+    fn a_kept_box_gets_a_ca_once_sealed_in_its_store() {
+        let s = setup();
+        let p = policy(&s, "");
+        let key = store::new_key().unwrap();
+        store::create(&s.layout, &s.layout.bundle("r"), &key).unwrap();
+        let sealed_at = |work: &Path| work.parent().unwrap().join("door/ca.sealed");
+
+        // A box made before the door ended TLS has no CA; the first run makes one.
+        let hook: Hook = Box::new(move |work| {
+            let sealed = fs::read(sealed_at(work)).expect("the CA is saved in the store");
+            assert!(!String::from_utf8_lossy(&sealed).contains("BEGIN"), "sealed, not plain");
+            assert!(!work.parent().unwrap().join("work/door").exists());
+        });
+        let first = Fake { key: key.clone(), hook: Some(hook), ..Fake::default() };
+        run(&s.layout, &first, &request(&s, &p, true)).unwrap();
+        let second = Fake { key: key.clone(), ..Fake::default() };
+        run(&s.layout, &second, &request(&s, &p, true)).unwrap();
+        let (a, b) = (first.seen.lock().unwrap().ca.clone().unwrap(), second.seen.lock().unwrap().ca.clone().unwrap());
+        assert_eq!(a, b, "later runs load the same CA");
+
+        // No VM mounts the folder it is in.
+        let mounted = first.seen.lock().unwrap().spec.clone().unwrap().5;
+        assert!(mounted.iter().all(|m| !m.0.ends_with("door") && !m.0.ends_with("log")), "{mounted:?}");
+
+        // A CA that doesn't open stops the run before any VM starts, rather than being replaced.
+        let hook: Hook = Box::new(move |work| fs::write(sealed_at(work), b"garbage that isn't a sealed CA at all").unwrap());
+        let damage = Fake { key: key.clone(), hook: Some(hook), ..Fake::default() };
+        run(&s.layout, &damage, &request(&s, &p, true)).unwrap();
+        let broken = Fake { key, ..Fake::default() };
+        let e = format!("{:#}", run(&s.layout, &broken, &request(&s, &p, true)).unwrap_err());
+        assert!(e.contains("CA"), "{e}");
+        assert!(!broken.calls().iter().any(|c| c == "start_vm"));
+        assert!(!store::is_mounted(&s.layout.mount_point("r")));
     }
 
     #[test]

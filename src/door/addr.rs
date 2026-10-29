@@ -4,11 +4,14 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use rustls::ClientConfig;
 use url::Url;
 
+use super::tls;
 use crate::policy::Site;
 
 pub const HTTPS_PORT: u16 = 443;
@@ -152,6 +155,8 @@ type Dial = Box<dyn Fn(SocketAddr) -> io::Result<TcpStream> + Send + Sync>;
 pub struct Net {
     resolve: Resolve,
     dial: Dial,
+    /// TLS to the sites (see `tls`): webpki's roots. Only tests change them.
+    tls: Arc<ClientConfig>,
 }
 
 impl Net {
@@ -163,12 +168,25 @@ impl Net {
                 stream.set_nodelay(true)?;
                 Ok(stream)
             }),
+            tls: tls::client_config(),
         }
     }
 
     #[cfg(test)]
     pub fn new(resolve: Resolve, dial: Dial) -> Self {
-        Self { resolve, dial }
+        Self { resolve, dial, tls: tls::client_config() }
+    }
+
+    /// The TLS settings for connections to the sites.
+    pub fn tls(&self) -> &Arc<ClientConfig> {
+        &self.tls
+    }
+
+    /// Trust only these roots for the sites, so a test can have a site of its own.
+    #[cfg(test)]
+    pub fn trusting(mut self, roots: rustls::RootCertStore) -> Self {
+        self.tls = tls::client_config_trusting(roots);
+        self
     }
 
     /// Connect to the host on port 443, at one of its public addresses and no other. The name

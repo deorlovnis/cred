@@ -10,6 +10,6 @@ description = "Also the browser (needs npm ci in runner/) and a real Touch ID ap
 run = "cd runner && npm ci --ignore-scripts --no-audit --no-fund --silent && cd .. && CRED_E2E_BROWSER=1 CRED_E2E_INTERACTIVE=1 cargo test --test e2e -- --ignored --test-threads=1"
 
 [tasks.e2e-box]
-description = "Engine end to end: builds the agent image and runs a VM (needs Apple container)"
+description = "Engine and door end to end: builds the agent image and runs VMs (needs Apple container and the internet)"
 env = { CRED_E2E_BOX = "1" }
-run = "cargo test --test box_engine -- --ignored --nocapture"
+run = "cargo test --test box_engine -- --ignored --nocapture && cargo test --bin cred real_vm -- --ignored --nocapture"

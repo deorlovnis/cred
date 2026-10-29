@@ -11,7 +11,7 @@
 #![allow(dead_code)] // used by the box commands
 
 use std::fs::DirBuilder;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -32,6 +32,10 @@ const DOOR_SOCKET: &str = "/run/cred/door.sock";
 /// What the box holds in place of the model key; the door's gateway swaps in the real one.
 /// Same value as the door's `STANDIN`.
 const STANDIN: &str = "cred-managed";
+/// Where the box CA is installed in the VM, and the bundle `update-ca-certificates` builds from it
+/// and the system's roots.
+pub const CA_CERT: &str = "/usr/local/share/ca-certificates/cred-box.crt";
+const CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 /// The longest Unix socket path macOS accepts (104 bytes, with the terminating NUL).
 const SOCKET_PATH_MAX: usize = 103;
 
@@ -57,6 +61,14 @@ pub fn agent_env(oauth: bool) -> Vec<(String, String)> {
         ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
         ("DISABLE_AUTOUPDATER", "1"),
         ("HOME", AGENT_HOME),
+        // The door ends TLS with the box CA. Node ignores the system store; the rest are told
+        // to use the bundle that includes the CA.
+        ("NODE_EXTRA_CA_CERTS", CA_CERT),
+        ("SSL_CERT_FILE", CA_BUNDLE),
+        ("REQUESTS_CA_BUNDLE", CA_BUNDLE),
+        ("CURL_CA_BUNDLE", CA_BUNDLE),
+        ("PIP_CERT", CA_BUNDLE),
+        ("GIT_SSL_CAINFO", CA_BUNDLE),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -203,6 +215,26 @@ pub fn exec_command(name: &str, env: &[(String, String)], cmd: &[String], tty: b
     c
 }
 
+/// Make the box's CA (a public certificate, PEM) trusted in the VM: written where
+/// `update-ca-certificates` looks and added to the system bundle, as root. The VM's system is
+/// thrown away when it stops, so this is done at every start.
+pub fn install_ca(name: &str, pem: &str) -> Result<()> {
+    let script = format!("cat > {CA_CERT} && update-ca-certificates");
+    let mut child = container()
+        .args(["exec", "--uid", "0", "--gid", "0", "-i", name, "sh", "-c", &script])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("running container exec")?;
+    child.stdin.take().expect("piped stdin").write_all(pem.as_bytes()).context("sending the CA to the VM")?;
+    let out = child.wait_with_output().context("installing the CA")?;
+    if !out.status.success() {
+        bail!("installing the box CA in {name}: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
 fn exists(name: &str) -> bool {
     capture(container().args(["inspect", name]), "inspecting the VM").is_ok()
 }
@@ -327,6 +359,11 @@ mod tests {
         assert_eq!(get(&key, "CLAUDE_CODE_OAUTH_TOKEN"), None);
         assert_eq!(get(&key, "HTTPS_PROXY").as_deref(), Some("http://127.0.0.1:3128"));
         assert_eq!(get(&key, "HOME").as_deref(), Some("/home/agent"));
+        // Node ignores the system store, so it gets the CA file; the others get the bundle.
+        assert_eq!(get(&key, "NODE_EXTRA_CA_CERTS").as_deref(), Some(CA_CERT));
+        for var in ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "PIP_CERT", "GIT_SSL_CAINFO"] {
+            assert_eq!(get(&key, var).as_deref(), Some("/etc/ssl/certs/ca-certificates.crt"), "{var}");
+        }
     }
 
     #[test]

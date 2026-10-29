@@ -4,7 +4,8 @@
 //! wants, one line `<kind>\n`, and then the connection carries that service:
 //!
 //! - `proxy`: an HTTP proxy that does CONNECT to port 443 of the hosts the box may reach, at
-//!   public addresses cred resolved and checked itself (see `proxy`, `addr`);
+//!   public addresses cred resolved and checked itself (see `proxy`, `addr`). With a box CA the
+//!   door ends the TLS inside the tunnel, so it can read the requests (see `tls`);
 //! - `cred`: plain HTTP to cred itself, where `/model/...` is the model gateway that swaps in
 //!   the real key (see `gateway`);
 //! - `mcp`: cred's MCP server for the box, limited to its sites.
@@ -15,7 +16,9 @@
 mod addr;
 mod gateway;
 mod http;
+mod inspect;
 mod proxy;
+mod tls;
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -37,6 +40,7 @@ use serde::Serialize;
 use crate::mcp::{self, Scope};
 use crate::policy;
 use addr::{Allow, Net};
+pub use tls::{BoxCa, PURPOSE as CA_PURPOSE};
 
 /// What the box holds in place of the model key. Worthless anywhere but at the gateway.
 pub const STANDIN: &str = "cred-managed";
@@ -64,6 +68,9 @@ pub struct Config {
     pub sites: Vec<String>,
     /// Where decisions are logged (JSON lines).
     pub log: PathBuf,
+    /// The box's CA. With it the door ends TLS and reads the requests inside (see `tls`);
+    /// without it, it tunnels bytes it can't read.
+    pub ca: Option<Arc<BoxCa>>,
 }
 
 /// A running door. Dropping it stops it.
@@ -339,5 +346,7 @@ impl Log {
     }
 }
 
+#[cfg(test)]
+mod intercept_tests;
 #[cfg(test)]
 mod tests;

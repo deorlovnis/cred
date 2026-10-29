@@ -21,6 +21,7 @@ mod mask;
 mod mcp;
 mod policy;
 mod refresh;
+mod seal;
 mod util;
 
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};

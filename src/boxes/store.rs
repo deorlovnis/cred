@@ -25,9 +25,10 @@ use crate::util::home;
 
 /// The most a store can hold; the bundle grows as needed and starts small.
 const SIZE: &str = "100g";
-/// Folders of a store. `log` is the door's and cred's; no VM mounts it.
-pub const FOLDERS: [&str; 4] = ["home", "work", "downloads", "log"];
+/// Folders of a store. `log` and `door` (the box CA, sealed) are cred's; no VM mounts them.
+pub const FOLDERS: [&str; 5] = ["home", "work", "downloads", "log", "door"];
 const DOOR_LOG: &str = "log/door.log";
+const CA_FILE: &str = "door/ca.sealed";
 
 /// Where a box's files live on the Mac. `real()` is the user's; tests build their own.
 pub struct Layout {
@@ -271,7 +272,9 @@ pub fn open(bundle: &Path, mnt: &Path, key: &str, readonly: bool) -> Result<Open
         for folder in FOLDERS {
             fs::create_dir_all(mnt.join(folder))?;
         }
-        fs::set_permissions(mnt.join("log"), fs::Permissions::from_mode(0o700))?;
+        for private in ["log", "door"] {
+            fs::set_permissions(mnt.join(private), fs::Permissions::from_mode(0o700))?;
+        }
         let marker = mnt.join(".metadata_never_index");
         if !marker.exists() {
             File::create(marker)?;
@@ -341,6 +344,11 @@ pub fn log_event(mnt: &Path, kind: &str, path: &str, bytes: u64, decision: &str)
 
 pub fn door_log(mnt: &Path) -> PathBuf {
     mnt.join(DOOR_LOG)
+}
+
+/// Where the box CA is sealed.
+pub fn ca_file(mnt: &Path) -> PathBuf {
+    mnt.join(CA_FILE)
 }
 
 /// What a copy brought over.

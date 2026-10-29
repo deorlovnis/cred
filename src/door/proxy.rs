@@ -1,7 +1,12 @@
 //! The `proxy` kind: an HTTP proxy that understands CONNECT to port 443 and nothing else. The
 //! box's tools send host names; cred decides by name whether the box may reach it, resolves it
-//! itself and connects to a public address (see `addr`), then copies bytes both ways. The TLS
-//! inside is end to end between the tool and the site; the door sees no requests.
+//! itself and connects to a public address (see `addr`).
+//!
+//! With a box CA (the normal case) the door then ends TLS. It makes its own verified TLS
+//! connection to the site first, so a site whose certificate doesn't verify gets a 502 and the
+//! guest never has a tunnel. Then it tells the guest the tunnel is open, answers the guest's TLS
+//! with a certificate from the box CA, and hands both sides, decrypted, to `inspect`. Without a
+//! CA it copies bytes both ways and sees no requests.
 
 use std::io::{self, BufReader, Read, Write};
 use std::net::{IpAddr, Shutdown, TcpStream};
@@ -11,6 +16,8 @@ use std::time::Duration;
 
 use super::addr::{HTTPS_PORT, split_target};
 use super::http::{self, Head};
+use super::inspect::{self, Ctx};
+use super::tls;
 use super::{Entry, Shared};
 
 /// The guest has this long to send its CONNECT line once it has taken a connection.
@@ -25,13 +32,45 @@ pub fn serve(sh: &Shared, mut reader: BufReader<UnixStream>, mut writer: UnixStr
     };
     let _ = writer.set_read_timeout(None);
     let Some((host, upstream, ip)) = connect_target(sh, &mut writer, &head) else { return };
+    let entry = |decision: &str, up, down| Entry { host: Some(host.clone()), addr: Some(ip.to_string()), up, down, ..Entry::new("proxy", decision) };
+    let Some(ca) = &sh.cfg.ca else {
+        if writer.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").is_err() {
+            return;
+        }
+        sh.log.write(&entry("allowed", 0, 0));
+        let (up, down) = tunnel(reader, writer, upstream);
+        sh.log.write(&entry("closed", up, down));
+        return;
+    };
+
+    // The site first: with a certificate that doesn't verify there is nothing to tunnel to.
+    let Ok(raw) = upstream.try_clone() else { return };
+    let site = match tls::connect(sh.net.tls(), &host, upstream) {
+        Ok(site) => site,
+        Err(e) => {
+            let why = format!("can't verify {host}: {e:#}");
+            return refuse(sh, &mut writer, entry(&format!("failed:tls: {e:#}"), 0, 0), 502, &why);
+        }
+    };
     if writer.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").is_err() {
         return;
     }
-    let entry = |decision, up, down| Entry { host: Some(host.clone()), addr: Some(ip.to_string()), up, down, ..Entry::new("proxy", decision) };
-    sh.log.write(&entry("allowed", 0, 0));
-    let (up, down) = tunnel(reader, writer, upstream);
-    sh.log.write(&entry("closed", up, down));
+    // A guest that doesn't trust the box CA fails here, and nothing reaches the site.
+    let _ = writer.set_read_timeout(Some(HEAD_TIMEOUT));
+    let guest = writer.try_clone().map_err(anyhow::Error::from).and_then(|w| tls::accept(ca, &host, reader, w));
+    let _ = writer.set_read_timeout(None);
+    match guest {
+        Ok(guest) => {
+            sh.log.write(&entry("allowed", 0, 0));
+            let (up, down) = inspect::serve(guest.clone(), site.clone(), &Ctx { shared: sh, host: &host });
+            let _ = guest.finish();
+            let _ = site.finish();
+            sh.log.write(&entry("closed", up, down));
+        }
+        Err(e) => sh.log.write(&entry(&format!("failed:tls: {e:#}"), 0, 0)),
+    }
+    let _ = raw.shutdown(Shutdown::Both);
+    let _ = writer.shutdown(Shutdown::Both);
 }
 
 /// The upstream connection a CONNECT request asks for. If the request is refused, say so to the
@@ -74,6 +113,8 @@ fn refuse(sh: &Shared, writer: &mut UnixStream, entry: Entry, status: u16, why: 
     sh.log.write(&entry);
     let reason = http::reason(status);
     let allow = if status == 405 { "Allow: CONNECT\r\n" } else { "" };
+    // `why` may carry another library's words; keep them to one line.
+    let why: String = why.chars().filter(|c| !c.is_control()).collect();
     let _ = write!(writer, "HTTP/1.1 {status} {reason}: {why}\r\n{allow}Content-Length: 0\r\nConnection: close\r\n\r\n");
     let _ = writer.flush();
 }
