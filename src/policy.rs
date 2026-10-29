@@ -7,6 +7,7 @@
 //! program), blocks the resource until it is approved again.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::process::Command;
 use std::{env, fs};
@@ -15,10 +16,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use similar::TextDiff;
 use url::{Host, Url};
 
 use crate::util::{config_dir, expand_home, sha256_hex};
-use crate::{approve, browser, keychain, parse_env, parse_field, parse_resource};
+use crate::{approve, ask, browser, interactive, keychain, parse_env, parse_field, parse_resource};
 
 /// Keychain field of a resource's approval record. Field names can't start with "_".
 const APPROVAL: &str = "_policy";
@@ -62,6 +64,16 @@ pub enum Mode {
     Deny,
 }
 
+impl Mode {
+    pub fn text(self) -> &'static str {
+        match self {
+            Mode::Allow => "allow",
+            Mode::Ask => "ask",
+            Mode::Deny => "deny",
+        }
+    }
+}
+
 /// Where a field's fresh value comes from: an executable (pinned by hash) or a browser.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -70,11 +82,24 @@ pub struct Refresh {
     pub from: Option<String>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Agent {
     #[serde(default)]
     pub consent: Consent,
+    /// How long a consent lasts, if the MCP server stays connected. 0: until it disconnects.
+    #[serde(default = "default_consent_minutes")]
+    pub consent_minutes: u64,
+}
+
+impl Default for Agent {
+    fn default() -> Self {
+        Self { consent: Consent::default(), consent_minutes: default_consent_minutes() }
+    }
+}
+
+fn default_consent_minutes() -> u64 {
+    240
 }
 
 #[derive(Deserialize, Default, Clone, Copy, PartialEq, Debug)]
@@ -132,6 +157,24 @@ pub struct Browse {
     /// Lets the agent take screenshots. Masking can't reach text inside an image.
     #[serde(default)]
     pub screenshots: bool,
+    /// The browser closes after this long without a call. 0: never.
+    #[serde(default = "default_idle_minutes")]
+    pub idle_minutes: u64,
+    /// The browser closes this long after it opened, however busy. 0: never.
+    #[serde(default = "default_max_minutes")]
+    pub max_minutes: u64,
+    /// Fields (a login's user and password) cred may type into pages on the origins, for
+    /// sites without a session to inject. Off unless listed.
+    #[serde(default)]
+    pub fill: Vec<String>,
+}
+
+fn default_idle_minutes() -> u64 {
+    10
+}
+
+fn default_max_minutes() -> u64 {
+    60
 }
 
 /// A cookie set from a stored field, e.g. the session token.
@@ -251,6 +294,12 @@ impl Browse {
                 bail!("[browse] cookie {} domain '{}' doesn't cover one of the origins", c.name, c.domain);
             }
         }
+        for field in &self.fill {
+            parse_field(field).map_err(|e| anyhow!("[browse] fill '{field}': {e}"))?;
+        }
+        if !self.fill.is_empty() && origins.iter().any(|s| matches!(s, Site::Any)) {
+            bail!("[browse] fill can't be used with origins = [\"*\"]: name the sites cred may type credentials into");
+        }
         for s in &self.local_storage {
             parse_field(&s.field).map_err(|e| anyhow!("[browse] local_storage {}: field: {e}", s.key))?;
             let origin = host_origin(&s.origin).map_err(|e| anyhow!("[browse] local_storage origin: {e}"))?;
@@ -272,6 +321,54 @@ pub struct Tool {
 }
 
 impl Policy {
+    /// What the policy allows in a few words, for listings: `run:ask fetch browse:ask`. The word
+    /// after a colon is the mode of `cred run`, or of writes where requests can also be sent.
+    pub fn summary(&self) -> String {
+        let with_writes = |name: &str, writes: Mode| if writes == Mode::Deny { name.to_string() } else { format!("{name}:{}", writes.text()) };
+        let mut parts = Vec::new();
+        if self.run.mode != Mode::Deny && !self.run.export.is_empty() {
+            parts.push(format!("run:{}", self.run.mode.text()));
+        }
+        parts.extend(self.fetch.as_ref().map(|f| with_writes("fetch", f.writes)));
+        parts.extend(self.browse.as_ref().map(|b| with_writes("browse", b.writes)));
+        if parts.is_empty() { "-".into() } else { parts.join(" ") }
+    }
+
+    /// What agents may do, as (label, text) lines for `cred info`.
+    pub fn rules(&self) -> Vec<(&'static str, String)> {
+        let consent = match (self.agent.consent, self.agent.consent_minutes) {
+            (Consent::Session, 0) => "session (Touch ID on first use)".to_string(),
+            (Consent::Session, m) => format!("session (Touch ID on first use, then every {m} min)"),
+            (Consent::None, _) => "none".to_string(),
+        };
+        let mut lines = vec![("agent", format!("consent {consent}"))];
+        if let Some(f) = &self.fetch {
+            let auth = f.auth.as_ref().map_or(String::new(), |_| format!("; auth in {}", f.auth_header));
+            lines.push(("fetch", format!("hosts {}; writes {}{auth}", f.hosts.join(", "), f.writes.text())));
+        }
+        for t in &self.tools {
+            lines.push(("tool", format!("{}: {}", t.name, t.request)));
+        }
+        if let Some(b) = &self.browse {
+            let mut text = format!("pages on {}", b.origins.join(", "));
+            if !b.requests.is_empty() {
+                text += &format!("; requests to {}", b.requests.join(", "));
+            }
+            text += &format!("; writes {}", b.writes.text());
+            if !b.allow_writes.is_empty() {
+                text += &format!(" (allowed: {})", b.allow_writes.join(", "));
+            }
+            text += if b.screenshots { "; screenshots" } else { "; no screenshots" };
+            if !b.fill.is_empty() {
+                text += &format!("; cred types {}", b.fill.join(", "));
+            }
+            let limit = |m: u64| if m == 0 { "none".to_string() } else { format!("{m} min") };
+            text += &format!("; closes when idle {}, at most {}", limit(b.idle_minutes), limit(b.max_minutes));
+            lines.push(("browse", text));
+        }
+        lines
+    }
+
     pub fn parse(text: &str) -> Result<Self> {
         let policy: Policy = toml::from_str(text)?;
         policy.validate()?;
@@ -459,6 +556,9 @@ struct Approval {
     policy: String,
     /// refresh script path -> sha256
     scripts: BTreeMap<String, String>,
+    /// The approved text itself, so a later edit can be shown as a diff. Absent in older records.
+    #[serde(default)]
+    text: Option<String>,
 }
 
 /// A policy that is approved and unchanged since.
@@ -543,6 +643,11 @@ impl Approved {
     }
 }
 
+/// The policy text as it was approved, if the approval record keeps it.
+fn approved_text(res: &str) -> Option<String> {
+    record(res)?.text
+}
+
 /// Forget a resource's approval; its policy has no effect until approved again.
 pub fn revoke(res: &str) {
     keychain::delete(res, APPROVAL);
@@ -567,7 +672,7 @@ fn prepare(res: &str) -> Result<Approval> {
         println!("pins {script} (sha256 {})", &hash[..12]);
     }
     println!("sha256 {}\n", &digest[..12]);
-    Ok(Approval { policy: digest, scripts })
+    Ok(Approval { policy: digest, scripts, text: Some(text) })
 }
 
 /// Approve the given resources' policies with one confirmation (all policies when none given).
@@ -598,6 +703,26 @@ pub fn show(res: &str) -> Result<()> {
     Ok(())
 }
 
+/// What changed from the approved text to the current one, as a unified diff. Colored
+/// (ANSI) for a terminal.
+fn diff(old: &str, new: &str, color: bool) -> String {
+    let body = TextDiff::from_lines(old, new).unified_diff().context_radius(3).to_string();
+    let paint = |code: &str, line: &str| if color { format!("\x1b[{code}m{line}\x1b[0m\n") } else { format!("{line}\n") };
+    let mut out = paint("1", "--- approved") + &paint("1", "+++ now");
+    for line in body.lines() {
+        out += &paint(
+            match line.as_bytes().first() {
+                Some(b'+') => "32",
+                Some(b'-') => "31",
+                Some(b'@') => "36",
+                _ => "0",
+            },
+            line,
+        );
+    }
+    out
+}
+
 pub fn edit(res: &str) -> Result<()> {
     let p = path(res);
     if !p.exists() {
@@ -609,8 +734,20 @@ pub fn edit(res: &str) -> Result<()> {
     if !status.success() {
         bail!("{editor} exited with {status}");
     }
-    Policy::parse(&fs::read_to_string(&p)?).with_context(|| p.display().to_string())?;
+    let text = fs::read_to_string(&p)?;
+    Policy::parse(&text).with_context(|| p.display().to_string())?;
+    // A policy approved before shows what the edit changes; a new one is shown whole when approved.
+    if let Some(old) = approved_text(res) {
+        if old == text {
+            println!("no change from the approved policy for {res}");
+            return Ok(());
+        }
+        println!("{}", diff(&old, &text, io::stdout().is_terminal()));
+    }
     println!("saved {} — it takes effect once approved: cred policy approve {res}", p.display());
+    if interactive() && ask("Approve it now? [y/N] ")?.eq_ignore_ascii_case("y") {
+        approve(&[res.to_string()])?;
+    }
     Ok(())
 }
 
@@ -622,11 +759,13 @@ export = {}            # field = "ENV_VAR", e.g. { token = "RES_TOKEN" }
 
 [agent]
 consent = "session"    # session: Touch ID once per agent session | none
+consent_minutes = 240  # a session consent lapses after this long (0: only when the agent disconnects)
 
 # [refresh.token]
 # run = "~/.config/cred/refresh/RES.sh"     # prints a fresh value; gets the fields that
 #                                           # aren't exported as CRED_<FIELD>
 # from = "firefox:https://example.com#key"  # or: read it from Firefox Local Storage
+#                                           # (firefox-cookie:… and chrome-cookie:… read a cookie)
 
 # [fetch]
 # hosts = ["https://api.example.com"]
@@ -675,6 +814,7 @@ mod tests {
         start = "https://app.example.com/home"
         cookies = [{ name = "session", field = "token", domain = ".example.com" }]
         local_storage = [{ origin = "https://app.example.com", key = "jwt", field = "token" }]
+        fill = ["user", "password"]
     "#;
 
     #[test]
@@ -684,6 +824,16 @@ mod tests {
         assert_eq!(p.agent.consent, Consent::Session);
         assert_eq!(p.tools[0].params(), ["id", "query"]);
         assert_eq!(Policy::parse("").unwrap().run.mode, Mode::Deny);
+    }
+
+    #[test]
+    fn time_limits_default_and_can_be_set() {
+        let p = Policy::parse(GOOD).unwrap();
+        assert_eq!((p.agent.consent_minutes, p.browse.unwrap().idle_minutes), (240, 10));
+        assert_eq!(Policy::parse("").unwrap().agent.consent_minutes, 240);
+        let p = Policy::parse("[agent]\nconsent_minutes = 0\n[browse]\norigins = [\"*\"]\nidle_minutes = 3\nmax_minutes = 30").unwrap();
+        let b = p.browse.unwrap();
+        assert_eq!((p.agent.consent_minutes, b.idle_minutes, b.max_minutes), (0, 3, 30));
     }
 
     #[test]
@@ -707,6 +857,8 @@ mod tests {
             ("[browse]\norigins = [\"https://a.example.com\"]\nallow_writes = [\"https://evil.com/x\"]", "allowed host"),
             ("[browse]\norigins = [\"https://*.com\"]", "like https://*.example.com"),
             ("[browse]\norigins = [\"ftp://*.example.com\"]", "like https://*.example.com"),
+            ("[browse]\norigins = [\"*\"]\nfill = [\"password\"]", "name the sites"),
+            ("[browse]\norigins = [\"https://a.example.com\"]\nfill = [\"_policy\"]", "fill '_policy'"),
         ];
         for (text, why) in bad {
             let err = format!("{:#}", Policy::parse(text).err().unwrap_or_else(|| panic!("accepted: {text}")));
@@ -724,6 +876,29 @@ mod tests {
         assert!(dom.covers_cookie("example.com") && dom.covers_cookie("app.example.com") && !dom.covers_cookie("other.com"));
         let p = Policy::parse("[browse]\norigins = [\"https://*.example.com\"]\nrequests = [\"*\"]\nstart = \"https://app.example.com/\"\nscreenshots = true\ncookies = [{ name = \"s\", field = \"token\", domain = \".example.com\" }]").unwrap();
         assert_eq!(p.browse.unwrap().requests(), ["*"]);
+    }
+
+    #[test]
+    fn summarizes_what_a_policy_allows() {
+        let p = Policy::parse(GOOD).unwrap();
+        assert_eq!(p.summary(), "run:ask fetch:ask browse:ask");
+        assert_eq!(Policy::parse("[run]\nexport = { token = \"T\" }\n[fetch]\nhosts = [\"https://a.example.com\"]").unwrap().summary(), "fetch");
+        assert_eq!(Policy::parse("").unwrap().summary(), "-");
+        let rules = p.rules();
+        let line = |label: &str| rules.iter().find(|(l, _)| *l == label).map(|(_, t)| t.as_str()).unwrap();
+        assert_eq!(line("fetch"), "hosts https://api.example.com, http://127.0.0.1:8080; writes ask; auth in Authorization");
+        assert!(line("browse").contains("allowed: https://app.example.com/api/telemetry") && line("browse").contains("no screenshots"));
+        assert_eq!(line("tool"), "item: GET https://api.example.com/items/{id}?q={query}");
+    }
+
+    #[test]
+    fn diffs_against_the_approved_text() {
+        let old = "[run]\nmode = \"ask\"\n";
+        let new = "[run]\nmode = \"allow\"\n";
+        let plain = diff(old, new, false);
+        assert_eq!(plain, "--- approved\n+++ now\n@@ -1,2 +1,2 @@\n [run]\n-mode = \"ask\"\n+mode = \"allow\"\n");
+        let colored = diff(old, new, true);
+        assert!(colored.contains("\x1b[31m-mode = \"ask\"\x1b[0m\n") && colored.contains("\x1b[32m+mode = \"allow\"\x1b[0m\n"));
     }
 
     #[test]

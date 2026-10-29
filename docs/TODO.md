@@ -2,12 +2,30 @@
 
 Open work, roughly in priority order. Status as of v0.5.1.
 
-## 1. Approvals that survive updates
+## 1. Boxes (priority)
+
+Isolated, encrypted workspaces where agents can do any work (search and read the web, run code,
+keep files) but can't get out. Design: [box-design.md](box-design.md).
+
+- Each box is a Linux VM (Apple `container`) whose only way out is a door in cred: allowed sites,
+  cred's tools, model calls. No credentials enter the box; the Keychain stays the only secret
+  store.
+- Data lives in an AES-256 store keyed from the Keychain; `cred box rm` deletes the key.
+- Covers the former items "OS sandbox around the browser", "supply chain of the browser" and the
+  encrypted session vault, and parts of the audit log and idle timeouts (for boxes).
+- Decisions are settled (end of the design). Phase 0 spikes 1–5 passed (results in the design):
+  a VM with no network reaches cred only through a published socket; Claude Code runs on the
+  subscription through the door with only a stand-in inside; stores, Chromium and Docker work
+  in VMs. Next: phase 1 (spike 6, Secure Enclave keys, only matters for phase 4).
+- Done when: phases 1–3 of the design pass their "Done when" tests.
+
+## 2. Approvals that survive updates
 
 Items cred writes (policy approvals, refreshed values) are tied to the exact build that wrote
 them, so after every install each resource is blocked until its policy is approved again
 (`install.sh` runs `cred policy approve` to make that one Touch ID). Without an Apple Developer
-Team ID, macOS doesn't tie them to the signing identity.
+Team ID, macOS doesn't tie them to the signing identity. Boxes make this more pressing: each box
+key would need one Keychain prompt after every update.
 
 - Try creating items with an explicit access list (`SecAccessCreate` +
   `SecTrustedApplicationCreateFromPath` for /usr/local/bin/cred, set via `kSecAttrAccess`), so
@@ -17,52 +35,35 @@ Team ID, macOS doesn't tie them to the signing identity.
   protection keychain with access control, i.e. Touch ID on the items themselves.
 - Done when: install a new build, and approved policies still read as approved, with no prompt.
 
-## 2. Audit log
+## 3. Audit log and idle timeouts in boxes
 
-An append-only record of every agent action: time, site, tool, method and URL (masked),
-decision (allowed, asked → yes/no, blocked). Never values. Consider chaining entries with an
-HMAC whose key is in the Keychain so edits show.
+`cred mcp` on the host has both. Boxes still need them: the smart
+door's log (design phase 2), and `idle` and `max` limits, lock when the screen locks or the Mac
+sleeps (design phase 4).
 
-## 3. Idle timeouts
+## 4. Review and verify (agent work from 2026-10-29)
 
-- Close an idle browser after N minutes; cap a session's total length.
-- Let consent (`agent.consent = "session"`) expire after a time, not only when the MCP server
-  disconnects.
+Merged to `main` on 2026-10-29: audit log and
+`cred audit`, consent and browser time limits, `info`/`ls` policy rules, the `policy edit` diff,
+repo e2e tests, SPA click waits, compact/ref snapshots, `browse_find`, `browse_requests`,
+blocked writes in `cred info`, `browse_fill_credential`, Firefox and Chrome cookie sources.
+Build, clippy and tests are clean (33 unit, 10 e2e, plus the browser e2e); none of it has run
+against the real Keychain.
 
-## 4. OS sandbox around the browser
-
-Run the runner and Chromium under a `sandbox-exec` profile: no writes outside a private temp
-dir, no reading the home folder beyond what the browser needs.
-
-## 5. Supply chain of the browser
-
-- The runner uses the user's Node (mise, user-writable) and Playwright's Chromium from
-  `~/Library/Caches/ms-playwright` (user-writable). Pin both: check the Chromium binary's hash
-  at start, or install Node and the browser root-owned next to the runner.
-
-## 6. Browser usability
-
-- Single-page apps: after `browse_click`, wait for the URL or content to change before taking
-  the snapshot (a click on a client-side link returned the old page).
-- Snapshots can be very large (60 KB). Add a compact mode, a snapshot of one element by ref, or
-  `browse_find(text)`.
-- Report the data requests a page made (URLs only, never headers), so an agent can find the API
-  behind a view and use `fetch` instead of scraping.
-- Writes from pages: a POST each page load (telemetry) means a Touch ID prompt each time with
-  `writes = "ask"`. Make `allow_writes` easier to discover, e.g. by listing blocked writes in
-  `cred info`.
-
-## 7. Sessions (rest of design step 2)
-
-- Encrypted session vault: capture the browser's updated cookies/storage on `browse_close` and
-  store them encrypted (key in the Keychain), so sessions the site rotates aren't lost.
-- `browse_fill_credential(ref, field)`: cred types a stored login into the page itself, only on
-  the site's own origin, for sites without a session to inject.
-- More session sources: Firefox cookies (`cookies.sqlite`), Chrome (needs the Keychain key that
-  encrypts its cookies).
-
-## 8. Small things
-
-- `cred info` and `cred ls`: show browse and fetch rules from the approved policy.
-- Policy `edit`: show a diff against the approved version before approving.
-- Run the end-to-end tests (`e2e`) from the repo instead of ad-hoc scripts.
+- Run `mise run e2e-opt-in` once: it needs one Touch ID for a throwaway `e2e-touchid-*` resource
+  and should remove it afterwards; check no `cred:e2e-touchid-*` item is left.
+- Audit log: the key `cred:_audit/hmac` is made on the first audited call; check that it is
+  created and read without surprises after an install (likely one Keychain prompt per new build,
+  see item 2). Chaining across several `cred mcp` processes at once is untested. A network error
+  on an allowed fetch is logged as `blocked`.
+- Audit HMAC is hand-written over `sha2` (checked against RFC 4231); consider the `hmac` crate.
+- Browser idle/max timeouts haven't run with a real browser.
+- `policy edit`'s "Approve it now?" prompt needs a TTY and has no test. Approvals made before this
+  build store no policy text, so they show no diff until approved again.
+- `browse_fill_credential`: no Touch ID per fill, the approved policy is the only gate, and
+  `fill` accepts wildcard origins (`https://*.example.com`). Decide whether either should be
+  tighter. `fill_command` (src/browse.rs) has no unit test.
+- Chrome cookie source: reading the "Chrome Safe Storage" password is untested (it prompts).
+- Blocked-write records (`~/.config/cred/blocked-writes/`) aren't locked; concurrent `cred mcp`
+  servers can lose an update.
+- A click that changes nothing now costs the 3 s SPA wait.
