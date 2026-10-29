@@ -9,6 +9,7 @@
 mod approve;
 mod browse;
 mod browser;
+mod engine;
 mod fetch;
 mod index;
 mod keychain;

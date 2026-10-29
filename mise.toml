@@ -1,2 +1,7 @@
 [tools]
 rust = "stable"
+
+[tasks.e2e-box]
+description = "Engine end to end: builds the agent image and runs a VM (needs Apple container)"
+env = { CRED_E2E_BOX = "1" }
+run = "cargo test --test box_engine -- --ignored --nocapture"
