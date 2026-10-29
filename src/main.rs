@@ -44,7 +44,7 @@ struct Meta {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Store or rotate a secret (hidden prompt); a new NAME is also asked for link and description
+    /// Store or rotate a secret (hidden prompt); also asks for link and description while they're empty
     Set {
         #[arg(value_parser = parse_name)]
         name: String,
@@ -255,14 +255,14 @@ fn cmd_set(name: &str, expires: Option<Date>, mut meta: Meta) -> Result<()> {
     if value.is_empty() {
         bail!("empty value, nothing stored");
     }
-    // Only a new NAME is asked for its link and description; rotating via set keeps them.
-    if kc_get(name).is_none() {
-        if meta.url.is_none() {
-            meta.url = Some(ask("Resource link (Enter to leave empty): ")?);
-        }
-        if meta.desc.is_none() {
-            meta.desc = Some(ask("Description (Enter to leave empty): ")?);
-        }
+    // Ask only for fields that are still empty, so rotating a described secret stays one prompt.
+    let idx = Index::load()?;
+    let current = idx.map.get(name);
+    if meta.url.is_none() && current.is_none_or(|e| e.url.is_empty()) {
+        meta.url = Some(ask("Resource link (Enter to leave empty): ")?);
+    }
+    if meta.desc.is_none() && current.is_none_or(|e| e.description.is_empty()) {
+        meta.desc = Some(ask("Description (Enter to leave empty): ")?);
     }
     store(name, &value, expires.map_or(Expiry::Keep, Expiry::Set), &meta)
 }
