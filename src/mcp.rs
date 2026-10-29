@@ -1,17 +1,23 @@
 //! `cred mcp`: an MCP server (JSON-RPC over stdio) through which an agent uses sites without
 //! ever seeing their credentials. Every call re-checks the site's approved policy, every
 //! result is masked, and when the policy asks for consent, a site's first use in a session
-//! needs Touch ID.
+//! needs Touch ID. Every call is written to the audit log, and consents and browsers lapse
+//! after the times the policy sets.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, BufRead, Write};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
+use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
+use crate::audit::{self, Body, Log};
 use crate::browse::Session;
 use crate::fetch::{self, Request};
 use crate::index::Index;
+use crate::limits::{self, Lease};
 use crate::mask::Masker;
 use crate::policy::{self, Approved, Consent, METHODS};
 use crate::refresh::refresh_due;
@@ -53,14 +59,41 @@ struct Server {
     /// Sites whose policy allows browsing.
     browsable: Vec<String>,
     tools: BTreeMap<String, SiteTool>,
-    consented: HashSet<String>,
+    /// When each site was consented to in this session.
+    consented: HashMap<String, Instant>,
     browser: Option<Session>,
+    /// The browser's idle and total-time deadlines; set while `browser` is.
+    lease: Option<Lease>,
+    audit: Log,
 }
 
 pub fn serve() -> Result<()> {
     let mut server = Server::start();
     let mut stdout = io::stdout().lock();
-    for line in io::stdin().lock().lines() {
+    // Lines arrive through a channel so the loop can wake up to close a browser that went idle.
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    loop {
+        let line = match server.browser_deadline() {
+            Some(deadline) => match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(line) => line,
+                Err(RecvTimeoutError::Timeout) => {
+                    server.close_expired_browser(Instant::now());
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
+            None => match rx.recv() {
+                Ok(line) => line,
+                Err(_) => break,
+            },
+        };
         let line = line?;
         if line.trim().is_empty() {
             continue;
@@ -99,7 +132,7 @@ impl Server {
             }
             sites.push(site);
         }
-        Self { sites, browsable, tools, consented: HashSet::new(), browser: None }
+        Self { sites, browsable, tools, consented: HashMap::new(), browser: None, lease: None, audit: Log::standard(true) }
     }
 
     fn handle(&mut self, line: &str) -> Option<String> {
@@ -122,17 +155,79 @@ impl Server {
             "tools/call" => {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = params.get("arguments").and_then(Value::as_object).cloned().unwrap_or_default();
-                if name == "browse_screenshot" {
-                    return Some(json!({ "jsonrpc": "2.0", "id": id, "result": self.screenshot(&args) }).to_string());
-                }
-                match self.call(name, &args) {
-                    Ok(text) => json!({ "content": [{ "type": "text", "text": text }], "isError": false }),
-                    Err(e) => json!({ "content": [{ "type": "text", "text": format!("{e:#}") }], "isError": true }),
-                }
+                self.audited(name, &args)
             }
             other => return Some(error_reply(id, -32601, &format!("method not found: {other}"))),
         };
         Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string())
+    }
+
+    /// Run a tool call and write it to the audit log. If the log can't take a line, the call
+    /// doesn't happen, so no action goes unrecorded.
+    fn audited(&mut self, name: &str, args: &Map<String, Value>) -> Value {
+        let refused = |e: anyhow::Error| json!({ "content": [{ "type": "text", "text": format!("audit log: {e:#}") }], "isError": true });
+        self.close_expired_browser(Instant::now());
+        if let Err(e) = self.audit.ready() {
+            return refused(e);
+        }
+        let (site, method, url) = self.audit_target(name, args);
+        approve::take_answers();
+        let result = self.run_tool(name, args);
+        let decision = audit::decide(&approve::take_answers(), result["isError"].as_bool() != Some(false));
+        let masker = Masker::new(Index::load().map(|i| i.values(&site)).unwrap_or_default());
+        if let Err(e) = self.audit.append(Body::new(&site, name, method.as_deref(), url.as_deref(), decision, &masker)) {
+            return refused(e);
+        }
+        if name.starts_with("browse_") {
+            match (&self.browser, &mut self.lease) {
+                (Some(_), Some(lease)) => lease.touch(Instant::now()),
+                _ => self.lease = None,
+            }
+        }
+        result
+    }
+
+    /// The site, method and URL a call is about, for the audit log.
+    fn audit_target(&self, name: &str, args: &Map<String, Value>) -> (String, Option<String>, Option<String>) {
+        let text = |key: &str| arg(args, key).ok();
+        let browsing = || self.browser.as_ref().map(|s| s.site.clone()).unwrap_or_default();
+        match name {
+            "fetch" => (text("site").unwrap_or_default(), text("method"), text("url")),
+            "browse_open" => (text("site").unwrap_or_default(), None, None),
+            "browse_goto" => (browsing(), Some("GET".into()), text("url")),
+            _ if name.starts_with("browse_") => (browsing(), None, None),
+            _ => {
+                let Some(t) = self.tools.get(name) else { return (String::new(), None, None) };
+                let expanded = policy::load(&t.site)
+                    .ok()
+                    .and_then(|a| a.policy.tools.iter().find(|p| p.name == t.tool)?.expand(args).ok());
+                (t.site.clone(), expanded.as_ref().map(|e| e.0.clone()), expanded.map(|e| e.1))
+            }
+        }
+    }
+
+    fn run_tool(&mut self, name: &str, args: &Map<String, Value>) -> Value {
+        if name == "browse_screenshot" {
+            return self.screenshot(args);
+        }
+        match self.call(name, args) {
+            Ok(text) => json!({ "content": [{ "type": "text", "text": text }], "isError": false }),
+            Err(e) => json!({ "content": [{ "type": "text", "text": format!("{e:#}") }], "isError": true }),
+        }
+    }
+
+    /// When the open browser must close if nothing uses it first.
+    fn browser_deadline(&self) -> Option<Instant> {
+        self.lease.as_ref().and_then(Lease::deadline)
+    }
+
+    fn close_expired_browser(&mut self, now: Instant) {
+        if self.lease.as_ref().is_some_and(|l| l.expired(now)) {
+            if let Some(session) = self.browser.take() {
+                eprintln!("cred mcp: closed the browser on {} (idle or open too long)", session.site);
+            }
+            self.lease = None;
+        }
     }
 
     fn list(&self) -> Vec<Value> {
@@ -215,6 +310,9 @@ impl Server {
             self.browser = None;
             let (session, text) = Session::open(&site, &approved)?;
             self.browser = Some(session);
+            if let Some(b) = &approved.policy.browse {
+                self.lease = Some(Lease::new(Instant::now(), b.idle_minutes, b.max_minutes));
+            }
             text
         } else {
             let session = self.browser.as_mut().ok_or_else(|| anyhow!("no browser is open (browse_open first)"))?;
@@ -290,11 +388,14 @@ impl Server {
     }
 
     fn consent(&mut self, site: &str, approved: &Approved) -> Result<()> {
-        if approved.policy.agent.consent == Consent::None || self.consented.contains(site) {
+        let minutes = approved.policy.agent.consent_minutes;
+        let holds = |granted: &Instant| limits::consent_holds(*granted, Instant::now(), minutes);
+        if approved.policy.agent.consent == Consent::None || self.consented.get(site).is_some_and(holds) {
             return Ok(());
         }
-        approve::confirm(&format!("let an agent use {site} through cred until it disconnects"))?;
-        self.consented.insert(site.to_string());
+        let how_long = if minutes == 0 { "until it disconnects".to_string() } else { format!("for {minutes} minutes") };
+        approve::confirm(&format!("let an agent use {site} through cred {how_long}"))?;
+        self.consented.insert(site.to_string(), Instant::now());
         Ok(())
     }
 

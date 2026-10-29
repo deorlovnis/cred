@@ -7,11 +7,13 @@
 //! Agents never get the credentials themselves.
 
 mod approve;
+mod audit;
 mod browse;
 mod browser;
 mod fetch;
 mod index;
 mod keychain;
+mod limits;
 mod mask;
 mod mcp;
 mod policy;
@@ -125,6 +127,15 @@ enum Cmd {
     },
     /// Serve agents over MCP (stdio): requests and site tools, credentials added by cred
     Mcp,
+    /// Show what agents did through `cred mcp` (never values); --verify checks nothing was altered
+    Audit {
+        /// How many of the latest entries to show
+        #[arg(short = 'n', long, default_value_t = 20)]
+        last: usize,
+        /// Check the whole log against its Keychain-held HMAC chain
+        #[arg(long)]
+        verify: bool,
+    },
     /// Re-create Keychain items so only the running cred may read them (after re-signing cred)
     Reseal {
         #[arg(value_parser = parse_resource)]
@@ -591,6 +602,7 @@ fn main() -> ExitCode {
         Cmd::Copy { resource, field } => ok(cmd_copy(&resource, &field)),
         Cmd::Run { resources, command } => cmd_run(resources, command),
         Cmd::Mcp => ok(mcp::serve()),
+        Cmd::Audit { last, verify } => ok(audit::show(last, verify)),
         Cmd::Reseal { resources } => ok(cmd_reseal(resources)),
     };
     match result {
