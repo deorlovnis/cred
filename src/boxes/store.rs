@@ -26,8 +26,9 @@ use crate::util::home;
 
 /// The most a store can hold; the bundle grows as needed and starts small.
 const SIZE: &str = "100g";
-/// Folders of a store. `log` and `door` (the box CA, sealed) are cred's; no VM mounts them.
-pub const FOLDERS: [&str; 5] = ["home", "work", "downloads", "log", "door"];
+/// Folders of a store. `log`, `door` (the box CA, sealed) and `browser` (sealed sessions) are
+/// cred's; no VM mounts them.
+pub const FOLDERS: [&str; 6] = ["home", "work", "downloads", "log", "door", "browser"];
 const DOOR_LOG: &str = "log/door.log";
 const CA_FILE: &str = "door/ca.sealed";
 
@@ -278,7 +279,7 @@ pub fn open(bundle: &Path, mnt: &Path, key: &str, readonly: bool) -> Result<Open
         for folder in FOLDERS {
             fs::create_dir_all(mnt.join(folder))?;
         }
-        for private in ["log", "door"] {
+        for private in ["log", "door", "browser"] {
             fs::set_permissions(mnt.join(private), fs::Permissions::from_mode(0o700))?;
         }
         let marker = mnt.join(".metadata_never_index");
@@ -350,6 +351,11 @@ pub fn log_event(mnt: &Path, log_key: &[u8; 32], kind: &str, path: &str, bytes: 
 
 pub fn door_log(mnt: &Path) -> PathBuf {
     mnt.join(DOOR_LOG)
+}
+
+/// Where the sealed browser sessions are, one file per site.
+pub fn browser_dir(mnt: &Path) -> PathBuf {
+    mnt.join("browser")
 }
 
 /// Where the box CA is sealed.

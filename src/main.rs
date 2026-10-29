@@ -217,6 +217,18 @@ enum BoxCmd {
         name: String,
         path: String,
     },
+    /// Sign in to a box's sites by hand, in a window on this Mac; cred seals each session into the box (Touch ID, box stopped)
+    #[command(after_help = "Without SITE, goes through the box's sites that allow browsing and have no sealed session yet, one window after another. \
+Closing a window (or Enter) takes the session; Ctrl-C skips that site. --all signs in again to the ones that have a session.")]
+    Login {
+        #[arg(value_parser = boxes::parse_name)]
+        name: String,
+        #[arg(value_parser = parse_resource)]
+        site: Option<String>,
+        /// Include sites that already have a sealed session
+        #[arg(long)]
+        all: bool,
+    },
     /// Delete a box for good: its key first, then its store (Touch ID)
     Rm {
         #[arg(value_parser = boxes::parse_name)]
@@ -721,6 +733,7 @@ fn main() -> ExitCode {
             BoxCmd::Stop { name } => ok(boxes::stop(&name)),
             BoxCmd::Export { name, path, to } => ok(boxes::export(&name, &path, &to)),
             BoxCmd::Import { name, path } => ok(boxes::import(&name, &path)),
+            BoxCmd::Login { name, site, all } => ok(boxes::login(&name, site.as_deref(), all)),
             BoxCmd::Rm { name } => ok(boxes::rm(&name)),
         },
     };

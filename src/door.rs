@@ -37,6 +37,7 @@ use anyhow::{Result, anyhow};
 use jiff::Timestamp;
 use serde::Serialize;
 
+use crate::browse::BoxBrowser;
 use crate::chain::Chain;
 use crate::mcp::{self, Scope};
 use crate::policy;
@@ -76,6 +77,8 @@ pub struct Config {
     pub ca: Option<Arc<BoxCa>>,
     /// The key of that chain, derived from the box key.
     pub log_key: [u8; 32],
+    /// The box's browser VM and sealed sessions, for the browser tools over `mcp`.
+    pub browser: Option<Arc<dyn BoxBrowser>>,
 }
 
 /// A running door. Dropping it stops it.
@@ -94,6 +97,16 @@ impl Door {
         let sh = shared.clone();
         let dialer = thread::Builder::new().name("door-dialer".into()).spawn(move || dial_loop(&sh))?;
         Ok(Door { shared, dialer: Some(dialer) })
+    }
+
+    /// Wait (up to `limit`) until no connection is in use. The agent's end of an MCP connection
+    /// is gone when its command ends, and the server then closes its browsers and seals their
+    /// sessions; this lets that finish before anything they need is stopped.
+    pub fn wait_idle(&self, limit: Duration) {
+        let until = std::time::Instant::now() + limit;
+        while self.shared.active.load(Ordering::SeqCst) > 0 && std::time::Instant::now() < until {
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[allow(dead_code)] // dropping a Door stops it too
@@ -246,7 +259,7 @@ fn serve(sh: &Shared, mut reader: BufReader<UnixStream>, writer: Option<UnixStre
 fn serve_mcp(sh: &Shared, reader: BufReader<UnixStream>, writer: UnixStream) {
     let (up, down) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
     sh.log.write(&Entry::new("mcp", "opened"));
-    let scope = Scope::boxed(&sh.cfg.name, &sh.cfg.sites);
+    let scope = Scope::boxed(&sh.cfg.name, &sh.cfg.sites, sh.cfg.browser.clone());
     let result = mcp::serve_io(Counting::new(reader, up.clone()), Counting::new(writer, down.clone()), scope);
     let decision = match result {
         Ok(()) => "closed".to_string(),

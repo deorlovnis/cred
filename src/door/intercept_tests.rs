@@ -178,7 +178,7 @@ fn the_door_ends_tls_for_a_guest_that_trusts_only_the_box_ca() {
     shim.0.set_nonblocking(true).unwrap();
     let log = dir.0.join("log").join("door.log");
     let door = Door::start_with(
-        Config { name: "testbox".into(), socket, allow: vec!["*".into()], model: None, sites: vec![], net: inspect::Net { writes: Mode::Allow, allow_writes: vec![] }, log_key: [9; 32], log: log.clone(), ca: Some(box_ca.clone()) },
+        Config { name: "testbox".into(), socket, allow: vec!["*".into()], model: None, sites: vec![], net: inspect::Net { writes: Mode::Allow, allow_writes: vec![] }, log_key: [9; 32], browser: None, log: log.clone(), ca: Some(box_ca.clone()) },
         net,
     )
     .unwrap();
@@ -289,7 +289,7 @@ fn real_vm_tools_trust_the_door_and_only_the_door() {
     };
     let ca = Arc::new(BoxCa::generate("e2e").unwrap());
     let log = dir.join("log").join("door.log");
-    let config = Config { name: name.clone(), socket: spec.socket.clone(), allow: vec!["*".into()], model: None, sites: vec![], net: Default::default(), log_key: [9; 32], log: log.clone(), ca: Some(ca.clone()) };
+    let config = Config { name: name.clone(), socket: spec.socket.clone(), allow: vec!["*".into()], model: None, sites: vec![], net: Default::default(), log_key: [9; 32], browser: None, log: log.clone(), ca: Some(ca.clone()) };
     let door = Door::start(config).unwrap();
     let vm = Vm(name.clone());
     engine::run(&spec).unwrap();

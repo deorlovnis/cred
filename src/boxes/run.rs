@@ -24,6 +24,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
+use super::sessions::{InBox, Sessions};
 use super::store::{self, Layout};
 use super::{BoxPolicy, MountPolicy, mount_problem};
 use crate::chain::{self, Chain};
@@ -34,6 +35,8 @@ const GUEST_HOME: &str = "/home/agent";
 const GUEST_WORK: &str = "/work";
 const GUEST_DOWNLOADS: &str = "/downloads";
 const GUEST_MOUNTS: &str = "/mnt";
+/// How long to wait for browsers to close and seal their sessions once the agent is gone.
+const SETTLE: Duration = Duration::from_secs(30);
 /// How often a stop request (a signal) is looked for while the agent works.
 const WATCH_EVERY: Duration = Duration::from_millis(100);
 
@@ -47,6 +50,9 @@ pub trait World: Sync {
     fn stop_vm(&self, vm: &str);
     /// Start the door. It stops when the returned value is dropped.
     fn start_door(&self, cfg: door::Config) -> Result<Box<dyn Any>>;
+    /// After the agent's command ended and before any VM stops: let the door finish what the end
+    /// of the agent's connections sets off (browsers closing, their sessions sealed).
+    fn settle(&self, _door: &dyn Any) {}
     /// Make the box's CA trusted inside the VM (as root, before the agent starts).
     fn install_ca(&self, vm: &str, pem: &str) -> Result<()>;
     fn model_uses_bearer(&self, model: &str) -> Result<bool>;
@@ -54,6 +60,8 @@ pub trait World: Sync {
     fn site_ready(&self, site: &str) -> Result<()>;
     /// The store key of a kept box.
     fn key(&self, name: &str) -> Result<String>;
+    /// Keep the names of the sites that have a sealed session, outside the store, for `cred box ls`.
+    fn record_sessions(&self, name: &str, sites: &[String]) -> Result<()>;
     /// Keep where the box's log chain stands, outside the store.
     fn record_log_head(&self, name: &str, head: &chain::Head) -> Result<()>;
     fn exec(&self, vm: &str, env: &[(String, String)], cmd: &[String], tty: bool) -> Result<ExitStatus>;
@@ -89,6 +97,12 @@ impl World for Real {
         Ok(Box::new(door::Door::start(cfg)?))
     }
 
+    fn settle(&self, door: &dyn Any) {
+        if let Some(door) = door.downcast_ref::<door::Door>() {
+            door.wait_idle(SETTLE);
+        }
+    }
+
     fn install_ca(&self, vm: &str, pem: &str) -> Result<()> {
         engine::install_ca(vm, pem)
     }
@@ -104,6 +118,10 @@ impl World for Real {
     fn key(&self, name: &str) -> Result<String> {
         keychain::get(&super::key(name), super::KEY_FIELD)
             .ok_or_else(|| anyhow!("the key of box {name} isn't in the Keychain, so its store can't be opened (cred box rm {name})"))
+    }
+
+    fn record_sessions(&self, name: &str, sites: &[String]) -> Result<()> {
+        super::keep_session_names(name, sites)
     }
 
     fn record_log_head(&self, name: &str, head: &chain::Head) -> Result<()> {
@@ -209,6 +227,8 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
         store.shred_on_close();
     }
     let ca = Arc::new(box_ca(&mnt, req.name, &key, req.persistent)?);
+    let sessions = Sessions::new(&mnt, &key, policy.browser.keep_sessions);
+    let sealed_sites = Sessions::new(&mnt, &key, true);
         let _ = store::log_event(&mnt, &log_key, "box", &req.id, 0, "started");
 
     // The folders are changed here, while no VM has them.
@@ -247,6 +267,7 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
         log: store::door_log(&mnt),
         ca: Some(ca.clone()),
         log_key,
+        browser: Some(Arc::new(InBox::new(sessions, Box::new(browser_runner)))),
     };
 
     // Declared in the order they start, so they drop in the order they must end: VM, door, store.
@@ -271,11 +292,16 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
         done.store(true, Ordering::SeqCst);
         status
     });
+    // Browsers the agent left open close now, sealing their sessions, while the VMs they use still run.
+    world.settle(door.as_ref());
 
     let _ = store::log_event(&mnt, &log_key, "box", &req.id, 0, "stopped");
     drop(vm_guard);
     drop(door);
     if req.persistent {
+        if let Err(e) = world.record_sessions(req.name, &sealed_sites.sites()) {
+            eprintln!("cred: keeping which sites of box {} have a session: {e:#}", req.name);
+        }
         record_head(world, req.name, &mnt, log_key);
     }
     drop(store);
@@ -284,6 +310,12 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
     }
     drop(lock);
     exit_code(status?)
+}
+
+// STUB: replaced at merge by the box's browser VM (start it with the first call, `engine::exec_runner`,
+// and give the door the token it accepts from this site's runner).
+fn browser_runner(_site: &str) -> Result<(std::process::Child, String)> {
+    bail!("the browser VM isn't available yet")
 }
 
 /// Note where the log's chain stands, so `cred box log --verify` can tell a log whose chain was
@@ -473,6 +505,7 @@ mod tests {
     use std::sync::{Condvar, Mutex};
 
     use super::*;
+    use crate::browse::BoxBrowser;
     use crate::util::TempDir;
 
     const DIGEST: &str = "cred-agent@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -482,6 +515,8 @@ mod tests {
     type NetSeen = (policy::Mode, Vec<String>, [u8; 32]);
     type ExecSeen = (Vec<(String, String)>, Vec<String>, bool);
     type Hook = Box<dyn Fn(&Path) + Sync + Send>;
+    /// Runs in exec with the door's browser and the store's mount point.
+    type BrowserHook = Box<dyn Fn(&dyn BoxBrowser, &Path) + Sync + Send>;
 
     #[derive(Default)]
     struct Seen {
@@ -495,6 +530,10 @@ mod tests {
         /// The lines of the log head recorded when the box was put away.
         log_head: Option<usize>,
         exec: Option<ExecSeen>,
+        /// The names of the sites with a sealed session, as recorded when the box was put away.
+        sessions: Option<Vec<String>>,
+        /// What the door was given to run browsers with.
+        browser: Option<Arc<dyn BoxBrowser>>,
         /// Files of the box as the agent would find them, read when it starts.
         files: BTreeMap<String, String>,
         stopped: bool,
@@ -514,6 +553,7 @@ mod tests {
         key: String,
         /// Runs in exec with the box's work folder.
         hook: Option<Hook>,
+        browser_hook: Option<BrowserHook>,
     }
 
     impl Fake {
@@ -565,6 +605,7 @@ mod tests {
             seen.door_ca = cfg.ca.as_ref().map(|ca| ca.cert_pem());
             seen.net = Some((cfg.net.writes, cfg.net.allow_writes, cfg.log_key));
             seen.door = Some((cfg.allow, cfg.model, cfg.sites, cfg.log));
+            seen.browser = cfg.browser;
             Ok(Box::new(()))
         }
 
@@ -586,6 +627,11 @@ mod tests {
 
         fn key(&self, _name: &str) -> Result<String> {
             Ok(self.key.clone())
+        }
+
+        fn record_sessions(&self, _name: &str, sites: &[String]) -> Result<()> {
+            self.seen.lock().unwrap().sessions = Some(sites.to_vec());
+            Ok(())
         }
 
         fn record_log_head(&self, _name: &str, head: &chain::Head) -> Result<()> {
@@ -615,6 +661,9 @@ mod tests {
                 }
                 if let Some(hook) = &self.hook {
                     hook(&work);
+                }
+                if let (Some(hook), Some(browser)) = (&self.browser_hook, &seen.browser) {
+                    hook(browser.as_ref(), work.parent().unwrap());
                 }
             }
             if self.block {
@@ -919,6 +968,68 @@ mod tests {
         assert!(e.contains("CA"), "{e}");
         assert!(!broken.calls().iter().any(|c| c == "start_vm"));
         assert!(!store::is_mounted(&s.layout.mount_point("r")));
+    }
+
+    /// Seals sessions through the door's browser while the box runs; the reading side sees what was kept.
+    fn seal_in(site: &'static str, state: &'static str) -> BrowserHook {
+        Box::new(move |browser, mnt| {
+            browser.seal(site, state).unwrap();
+            assert!(mnt.join("browser").is_dir(), "the sessions folder is in the store");
+        })
+    }
+
+    #[test]
+    fn sessions_are_sealed_in_the_store_and_no_vm_mounts_them() {
+        let s = setup();
+        let p = policy(&s, "");
+        let key = store::new_key().unwrap();
+        store::create(&s.layout, &s.layout.bundle("r"), &key).unwrap();
+        let state = r#"{"cookies":[{"name":"sid","value":"SESSION-VALUE-0123456789"}],"origins":[]}"#;
+
+        let first = Fake { key: key.clone(), browser_hook: Some(seal_in("github", state)), ..Fake::default() };
+        run(&s.layout, &first, &request(&s, &p, true)).unwrap();
+        let seen = first.seen.lock().unwrap();
+        assert_eq!(seen.sessions.as_deref(), Some(&["github".to_string()][..]), "which sites have a session is noted outside the store");
+        let mounted = seen.spec.clone().unwrap().5;
+        assert!(mounted.iter().all(|m| !m.0.ends_with("browser") && !m.0.to_string_lossy().contains("/browser/")), "no VM mounts the sessions: {mounted:?}");
+        assert!(mounted.iter().all(|m| !m.1.contains("browser")), "{mounted:?}");
+        drop(seen);
+
+        // The next run finds it again, opened with the key the box key gives; the file holds no plain value.
+        let read = Box::new(move |browser: &dyn BoxBrowser, mnt: &Path| {
+            assert_eq!(browser.sealed("github").unwrap().as_deref(), Some(state));
+            assert_eq!(browser.sealed("other").unwrap(), None);
+            let file = fs::read(mnt.join("browser/github.sealed")).unwrap();
+            assert!(!String::from_utf8_lossy(&file).contains("SESSION-VALUE"));
+            // A file for one site isn't another's.
+            fs::copy(mnt.join("browser/github.sealed"), mnt.join("browser/other.sealed")).unwrap();
+            assert!(browser.sealed("other").is_err());
+            fs::remove_file(mnt.join("browser/other.sealed")).unwrap();
+        });
+        let second = Fake { key: key.clone(), browser_hook: Some(read), ..Fake::default() };
+        run(&s.layout, &second, &request(&s, &p, true)).unwrap();
+        assert_eq!(second.seen.lock().unwrap().sessions.as_deref(), Some(&["github".to_string()][..]));
+
+        // With the box gone, there is no store to write into.
+        let browser = second.seen.lock().unwrap().browser.clone().unwrap();
+        assert!(browser.seal("github", "{}").is_err());
+        assert!(!store::is_mounted(&s.layout.mount_point("r")) && !s.layout.mount_point("r").exists());
+    }
+
+    #[test]
+    fn a_box_that_keeps_no_sessions_never_writes_one() {
+        let s = setup();
+        let p = policy(&s, "[browser]\nkeep_sessions = false");
+        let key = store::new_key().unwrap();
+        store::create(&s.layout, &s.layout.bundle("r"), &key).unwrap();
+        let hook: BrowserHook = Box::new(|browser, mnt| {
+            browser.seal("github", "{\"cookies\":[]}").unwrap();
+            assert_eq!(browser.sealed("github").unwrap(), None);
+            assert!(fs::read_dir(mnt.join("browser")).unwrap().next().is_none(), "nothing was written");
+        });
+        let fake = Fake { key, browser_hook: Some(hook), ..Fake::default() };
+        run(&s.layout, &fake, &request(&s, &p, true)).unwrap();
+        assert_eq!(fake.seen.lock().unwrap().sessions.as_deref(), Some(&[][..]));
     }
 
     #[test]

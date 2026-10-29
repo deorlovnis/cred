@@ -323,7 +323,7 @@ fn shared(dir: &Path, name: &str, writes: Mode, allow_writes: &[&str]) -> Arc<Sh
         sites: vec!["app".into(), "readonly".into(), "askme".into(), "pending".into()],
         net: Net { writes, allow_writes: allow_writes.iter().map(|p| p.to_string()).collect() },
         log: dir.join(format!("{name}.log")),
-        log_key: LOG_KEY,
+        log_key: LOG_KEY, browser: None,
         ca: None,
     };
     Arc::new(Shared::new(config, Dial::system()).unwrap())

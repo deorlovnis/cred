@@ -585,7 +585,7 @@ fn box_new_refuses_policies_the_door_cannot_keep() {
     for (toml, why) in [
         ("[net]\nallow_writes = [\"http://a.example.com/x\"]\n", "allow_writes"),
         ("standins = [\"HTTPS_PROXY\"]\n", "set by cred already"),
-        ("[browser]\nkeep_sessions = true\n", "phase 3"),
+        ("[browser]\nkeep_session = true\n", "unknown field"),
         ("[[mount]]\npath = \"/opt/data\"\nmode = \"rw\"\n", "rw isn't available"),
         ("nope = 1\n", "unknown field"),
     ] {
@@ -594,6 +594,124 @@ fn box_new_refuses_policies_the_door_cannot_keep() {
         assert!(!env.box_key_path("bad").exists() && !env.box_store("bad").exists(), "nothing is made for a bad policy");
         fs::remove_file(env.box_policy_path("bad")).unwrap();
     }
+}
+
+/// `cred box login` with a stand-in for the window (see tests/fixtures/fake-runner.mjs). `enter_at`
+/// is a line of its output after which the "person" presses Enter in the terminal.
+fn box_login(env: &Env, args: &[&str], enter_at: Option<&str>) -> (Output, String) {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-runner.mjs");
+    let mut child = env
+        .command()
+        .args(["box", "login"])
+        .args(args)
+        .env("CRED_TEST_LOGIN_RUNNER", script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut shown = String::new();
+    let mut lines = BufReader::new(child.stdout.take().unwrap());
+    loop {
+        let mut line = String::new();
+        if lines.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        shown += &line;
+        if enter_at.is_some_and(|at| line.contains(at)) {
+            // The window is open by now; Enter typed before it opened would not count.
+            thread::sleep(std::time::Duration::from_millis(700));
+            let _ = writeln!(stdin);
+        }
+    }
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    (out, shown)
+}
+
+#[test]
+fn box_login_signs_in_site_by_site_and_seals_each_session_in_the_box() {
+    let env = Env::new();
+    let origin = "http://127.0.0.1:9";
+    // Sites that can be signed in to (the first window closes itself, the second waits for Enter,
+    // the third is closed without signing in), one that has no browser, one that is not the box's.
+    env.policy("app", &format!("[browse]\norigins = [\"{origin}\"]\nstart = \"{origin}/autoclose?site=app\"\n"));
+    env.policy("docs", &format!("[browse]\norigins = [\"{origin}\"]\nstart = \"{origin}/wait?site=docs\"\n"));
+    env.policy("plain", &format!("[fetch]\nhosts = [\"{origin}\"]\nauth = \"Bearer {{token}}\"\n"));
+    env.policy("blank", &format!("[browse]\norigins = [\"{origin}\"]\nstart = \"{origin}/nothing\"\n"));
+    env.policy("elsewhere", &format!("[browse]\norigins = [\"{origin}\"]\nstart = \"{origin}/autoclose?site=elsewhere\"\n"));
+    let editor = env.editor_writing("sites = [\"app\", \"docs\", \"plain\", \"blank\"]\n");
+    assert!(env.boxed(&editor, &["new", "research"]).status.success());
+    assert!(env.boxed("true", &["approve", "research"]).status.success());
+
+    // Touch ID is asked first, and a refusal opens nothing.
+    let out = env.command().args(["box", "login", "research"]).env("CRED_TEST_APPROVE", "no").output().unwrap();
+    assert!(!out.status.success() && stderr(&out).contains("not approved"), "{}", stderr(&out));
+    assert!(!stdout(&out).contains("signing in"));
+
+    // A running box can't be signed in to: nothing may change a folder its VM has mounted.
+    let open_dir = env.dir.join("home/Library/Application Support/cred/box/open");
+    fs::create_dir_all(&open_dir).unwrap();
+    let held = fs::OpenOptions::new().create(true).truncate(false).write(true).open(open_dir.join("research.lock")).unwrap();
+    held.lock().unwrap();
+    let (out, shown) = box_login(&env, &["research"], None);
+    assert!(!out.status.success() && stderr(&out).contains("is running: stop it first"), "{}", stderr(&out));
+    assert!(!shown.contains("signing in"));
+    held.unlock().unwrap();
+    drop(held);
+
+    // Not the box's site, a site with no browser: refused before anything opens.
+    for (site, why) in [("elsewhere", "isn't one of box research's sites"), ("plain", "doesn't allow browsing")] {
+        let (out, shown) = box_login(&env, &["research", site], None);
+        assert!(!out.status.success() && stderr(&out).contains(why), "{site}: {}", stderr(&out));
+        assert!(!shown.contains("signing in"));
+    }
+
+    // Every site that can be signed in to, one window after another.
+    let (out, shown) = box_login(&env, &["research"], Some("docs (2 of 3)"));
+    assert!(out.status.success(), "{}\n{}", shown, stderr(&out));
+    for line in [
+        "signing in to app (1 of 3): close the window when done",
+        "sealed the session for app in the box",
+        "signing in to docs (2 of 3): close the window when done",
+        "sealed the session for docs in the box",
+        "signing in to blank (3 of 3): close the window when done",
+        "blank: nothing signed in, so nothing sealed",
+        "2 of 3 sites signed in",
+    ] {
+        assert!(shown.contains(line), "missing {line:?} in:\n{shown}");
+    }
+    assert!(!shown.contains("plain"), "a site without a browser isn't offered: {shown}");
+    // The session itself is never shown.
+    let everything = format!("{shown}{}", stderr(&out));
+    for secret in ["signed-in-to", "by-hand", "local-app", "local-docs"] {
+        assert!(!everything.contains(secret), "{secret} was printed:\n{everything}");
+    }
+    let ls = stdout(&env.boxed("true", &["ls"]));
+    assert!(ls.contains("SESSIONS") && ls.contains("app, docs"), "{ls}");
+
+    // The sessions are in the store, sealed.
+    let out_dir = env.dir.join("out");
+    fs::create_dir(&out_dir).unwrap();
+    for site in ["app", "docs"] {
+        let out = env.boxed("true", &["export", "research", &format!("browser/{site}.sealed"), "--to", out_dir.to_str().unwrap()]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        let file = fs::read(out_dir.join(format!("{site}.sealed"))).unwrap();
+        assert!(file.len() > 100 && !text(&file).contains("signed-in-to"), "{site}: sealed, not plain");
+    }
+    assert!(!out_dir.join("blank.sealed").exists());
+
+    // Run again: only the site that got no session is offered; --all asks for every site again.
+    let (out, shown) = box_login(&env, &["research"], None);
+    assert!(out.status.success() && shown.contains("signing in to blank (1 of 1)") && !shown.contains("app"), "{shown}{}", stderr(&out));
+    assert!(shown.contains("0 of 1 sites signed in"), "{shown}");
+    let (out, shown) = box_login(&env, &["research", "--all"], Some("docs (2 of 3)"));
+    assert!(out.status.success() && shown.contains("signing in to app (1 of 3)") && shown.contains("2 of 3 sites signed in"), "{shown}{}", stderr(&out));
+
+    // One named site goes straight to it, even with a session already.
+    let (out, shown) = box_login(&env, &["research", "app"], None);
+    assert!(out.status.success() && shown.contains("signing in to app (1 of 1)") && shown.contains("1 of 1 sites signed in"), "{shown}{}", stderr(&out));
 }
 
 #[test]

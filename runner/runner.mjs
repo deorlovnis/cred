@@ -15,6 +15,10 @@ const CHANGE_WAIT = 3000;
 const REQUEST_LIMIT = 100;
 const FIND_LIMIT = 50;
 let config, browser, context, page;
+// The newest storage state seen while a person signs in by hand (`config.login`): the window can
+// be closed before cred asks for it.
+let lastState = null;
+let closing = false;
 const notes = [];
 const requests = new Set();
 let blockedWrites = false;
@@ -171,34 +175,61 @@ const locate = (ref) => {
   return page.locator(`aria-ref=${ref}`);
 };
 
+// While a person signs in: keep the latest storage state, and tell cred when the last window
+// closes, with what was kept.
+function watchLogin() {
+  const timer = setInterval(() => context.storageState().then((s) => { lastState = s; }, () => {}), 250);
+  const finish = () => {
+    clearInterval(timer);
+    if (closing) return;
+    closing = true;
+    send({ closed: true, storageState: lastState });
+    browser.close().catch(() => {}).finally(() => process.exit(0));
+  };
+  browser.on('disconnected', finish);
+  context.on('page', (p) => p.on('close', () => context.pages().length === 0 && finish()));
+  page.on('close', () => context.pages().length === 0 && finish());
+}
+
 const commands = {
   async open(msg) {
     config = msg.config;
-    // Playwright passes --no-sandbox unless asked for Chromium's own sandbox.
-    browser = await chromium.launch({ headless: true, chromiumSandbox: true });
+    // Playwright passes --no-sandbox unless asked for Chromium's own sandbox. `login` is a person
+    // signing in by hand (`headed`: in a window): no rules apply to what they do, and cred
+    // takes the session they end up with.
+    browser = await chromium.launch({ headless: config.headed !== true, chromiumSandbox: true });
     context = await browser.newContext({
       serviceWorkers: 'block',
       acceptDownloads: false,
-      viewport: { width: 1280, height: 900 },
+      viewport: config.headed ? null : { width: 1280, height: 900 },
     });
-    await context.route('**/*', guard);
-    context.on('request', recordRequest);
-    await context.routeWebSocket(/.*/, (ws) => {
-      if (allowed(config.origins.concat(config.requests), originOf(ws.url()))) return ws.connectToServer();
-      note(`blocked websocket ${ws.url().slice(0, 120)}`);
-      ws.close();
-    });
+    if (!config.login) {
+      await context.route('**/*', guard);
+      context.on('request', recordRequest);
+      await context.routeWebSocket(/.*/, (ws) => {
+        if (allowed(config.origins.concat(config.requests), originOf(ws.url()))) return ws.connectToServer();
+        note(`blocked websocket ${ws.url().slice(0, 120)}`);
+        ws.close();
+      });
+    }
     if (config.cookies.length) await context.addCookies(config.cookies);
     if (config.storage.length) {
+      // Once per page visit: the page may have changed the value since (a rotating token).
       await context.addInitScript((entries) => {
         for (const e of entries) {
-          if (location.origin === e.origin) {
-            try { localStorage.setItem(e.key, e.value); } catch {}
-          }
+          if (location.origin !== e.origin) continue;
+          try {
+            const seeded = `__cred_seeded:${e.key}`;
+            if (sessionStorage.getItem(seeded) === null) {
+              sessionStorage.setItem(seeded, '1');
+              localStorage.setItem(e.key, e.value);
+            }
+          } catch {}
         }
       }, config.storage);
     }
     page = await context.newPage();
+    if (config.login) watchLogin();
     if (config.start) await page.goto(config.start, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     return describe();
   },
@@ -239,9 +270,13 @@ const commands = {
     await page.goBack({ timeout: 15_000 });
     return describe();
   },
+  // The session the browser ends with, for cred to keep; cookies and Local Storage, as Playwright
+  // writes them.
   async close() {
-    await browser?.close();
-    return 'closed';
+    closing = true;
+    const storageState = await context?.storageState().catch(() => lastState) ?? lastState;
+    await browser?.close().catch(() => {});
+    return JSON.stringify({ storageState });
   },
 };
 

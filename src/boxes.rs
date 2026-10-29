@@ -9,10 +9,13 @@
 //!
 //! The door sees every request (see `door::inspect`): `[net] allow` says which hosts the box may
 //! reach, `writes` and `allow_writes` what it may send them besides reads, and `standins` which
-//! environment variables hold the stand-in for a site's credential. Fields of a later phase
-//! (`[browser]`) are refused, not ignored.
+//! environment variables hold the stand-in for a site's credential. `[browser]` says whether a
+//! site's browser session is kept between runs: sealed in the store's `browser/` folder, which no
+//! VM mounts (see `sessions`; `cred box login` signs in by hand, see `login`).
 
+mod login;
 mod run;
+pub(crate) mod sessions;
 mod store;
 
 use std::collections::BTreeSet;
@@ -32,6 +35,7 @@ use crate::door::inspect::parse_prefix;
 use crate::policy::{self, Approval, Mode, Site, Status};
 use crate::util::{config_dir, expand_home, home};
 use crate::{approve, engine, keychain, parse_env, parse_resource};
+pub use login::login;
 use store::Layout;
 
 /// Keychain names of box items start with this. Resource names can't contain a dot.
@@ -40,6 +44,9 @@ pub const KEY_PREFIX: &str = "box.";
 const KEY_FIELD: &str = "_key";
 /// The Keychain field of where the box's door log stood when it last stopped (`chain::Head`).
 pub const LOG_HEAD_FIELD: &str = "_loghead";
+/// The Keychain field with the names of the sites that have a sealed session, kept by the cred that
+/// sealed them so `cred box ls` can show them without opening the store.
+const SESSIONS_FIELD: &str = "_sessions";
 /// A box's name also names its VM and its socket (104-byte limit), so it stays short.
 const MAX_NAME: usize = 32;
 
@@ -108,10 +115,30 @@ pub struct BoxPolicy {
     pub docker: bool,
     #[serde(default)]
     pub net: Net,
-    /// Phase 3. Any value is refused until the browser lives in the box.
-    pub browser: Option<toml::Value>,
+    #[serde(default)]
+    pub browser: BrowserPolicy,
     #[serde(default, rename = "mount")]
     pub mounts: Vec<MountPolicy>,
+}
+
+/// The sandboxed browser agents get for the `sites` whose own policy allows browsing.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserPolicy {
+    /// Seal each site's session (cookies and Local Storage) when its browser closes, and start the
+    /// next one from it.
+    #[serde(default = "default_keep")]
+    pub keep_sessions: bool,
+    /// Pages may download files; they are saved on the Mac outside the box, never in it.
+    #[allow(dead_code)] // read where the browser VM gets its downloads folder
+    #[serde(default)]
+    pub downloads: bool,
+}
+
+impl Default for BrowserPolicy {
+    fn default() -> Self {
+        Self { keep_sessions: true, downloads: false }
+    }
 }
 
 /// Where the agent's own requests may go.
@@ -253,9 +280,6 @@ impl BoxPolicy {
         for entry in &self.net.allow_writes {
             parse_prefix(entry).map_err(|e| anyhow!("[net] allow_writes '{entry}': {e}"))?;
         }
-        if self.browser.is_some() {
-            bail!("[browser] arrives with phase 3 (the browser in the box): leave it out");
-        }
         let mut names = BTreeSet::new();
         for m in &self.mounts {
             match m.mode.as_str() {
@@ -298,6 +322,10 @@ sites = []                              # resources the agent may use through cr
 keep = true                            # false: the box is shredded when it stops
 cpus = 4
 memory = "8G"
+
+[browser]                               # the sandboxed browser, for `sites` whose own policy has a [browse] section
+# keep_sessions = true                  # seal each site's session when its browser closes, so the next one starts signed in (`cred box login {name}` signs in by hand)
+# downloads = false                     # true: pages may download files, kept on the Mac outside the box (`cred box import` brings one in)
 
 [net]                                   # where the agent's own requests may go; nothing else is reachable
 allow = ["*"]                           # any public https site, reads only (see writes); or a list like ["https://*.wikipedia.org"], or [] for nowhere
@@ -371,6 +399,20 @@ fn derive(box_key: &[u8], purpose: &str) -> [u8; 32] {
 /// key as the Keychain holds it.
 fn log_key(key: &str) -> [u8; 32] {
     derive(key.as_bytes(), "log")
+}
+
+/// Note which sites of the box have a sealed session (names only).
+fn keep_session_names(name: &str, sites: &[String]) -> Result<()> {
+    if sites.is_empty() {
+        keychain::delete(&key(name), SESSIONS_FIELD);
+        return Ok(());
+    }
+    keychain::set(&key(name), SESSIONS_FIELD, &sites.join(","))
+}
+
+/// The sites of the box that had a sealed session when it was last put away.
+fn session_names(name: &str) -> Vec<String> {
+    keychain::get_silently(&key(name), SESSIONS_FIELD).map(|s| s.split(',').filter(|n| !n.is_empty()).map(str::to_string).collect()).unwrap_or_default()
 }
 
 fn has_key(name: &str) -> bool {
@@ -633,6 +675,7 @@ pub fn rm(name: &str) -> Result<()> {
     // The key goes first: without it the store is noise, whatever happens to the files.
     keychain::delete(&k, KEY_FIELD);
     keychain::delete(&k, LOG_HEAD_FIELD);
+    keychain::delete(&k, SESSIONS_FIELD);
     policy::revoke(&k);
     store::shred(&bundle)?;
     run::sweep(&layout, name)?;
@@ -659,7 +702,7 @@ fn human(bytes: u64) -> String {
 
 pub fn ls() -> Result<()> {
     let layout = Layout::real()?;
-    println!("{:<20} {:<9} {:<22} {:>9}  {:<17} {:<24} ABOUT", "BOX", "STATE", "POLICY", "SIZE", "LAST USED", "SITES");
+    println!("{:<20} {:<9} {:<22} {:>9}  {:<17} {:<24} {:<16} ABOUT", "BOX", "STATE", "POLICY", "SIZE", "LAST USED", "SITES", "SESSIONS");
     let mut shown = names();
     // Stores whose policy file is gone.
     for entry in fs::read_dir(&layout.root).into_iter().flatten().flatten() {
@@ -686,14 +729,15 @@ pub fn ls() -> Result<()> {
         let sites = parsed.as_ref().map_or(String::new(), |p| p.sites.join(", "));
         let about = parsed.as_ref().map_or("", |p| p.about.as_str());
         let size = if bundle.exists() { human(bytes) } else { "-".into() };
-        println!("{name:<20} {state:<9} {status:<22} {size:>9}  {used:<17} {sites:<24} {about}");
+        let sessions = session_names(name).join(", ");
+        println!("{name:<20} {state:<9} {status:<22} {size:>9}  {used:<17} {sites:<24} {sessions:<16} {about}");
     }
     // Temporary boxes that are running.
     for entry in fs::read_dir(layout.open_dir()).into_iter().flatten().flatten() {
         let file = entry.file_name().to_string_lossy().into_owned();
         let Some(id) = file.strip_suffix(".lock").filter(|id| id.contains("-tmp-")) else { continue };
         if store::is_held(&entry.path()) {
-            println!("{id:<20} {:<9} {:<22} {:>9}  {:<17} {:<24} temporary", "open", "-", "-", "-", "");
+            println!("{id:<20} {:<9} {:<22} {:>9}  {:<17} {:<24} {:<16} temporary", "open", "-", "-", "-", "", "");
         }
     }
     if shown.is_empty() {
@@ -763,7 +807,8 @@ mod tests {
     fn rejects_what_the_door_cannot_keep() {
         for (text, why) in [
             ("docker = true", "docker = true isn't available"),
-            ("[browser]\nkeep_sessions = true", "phase 3"),
+            ("[browser]\nkeep_session = true", "unknown field"),
+            ("[browser]\ndownloads = \"yes\"", "invalid type"),
             ("[[mount]]\npath = \"/opt/data\"\nmode = \"rw\"", "rw isn't available"),
             ("[[mount]]\npath = \"/opt/data\"\nmode = \"x\"", "isn't clone or ro"),
         ] {
