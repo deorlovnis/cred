@@ -24,6 +24,7 @@ use clap::{Args, Parser, Subcommand};
 use jiff::Timestamp;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
+use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
 use security_framework::passwords::{
     delete_generic_password, get_generic_password, set_generic_password,
 };
@@ -99,7 +100,7 @@ enum Cmd {
     },
     /// Refresh a field automatically (--cmd or --from) or stop (--off); no flags shows the setting
     #[command(after_help = "A --cmd command must print the new value on stdout. It gets the \
-                            resource's fields as CRED_<FIELD>, e.g. CRED_USER and CRED_SESSION.\n\
+                            resource's fields that stay inside cred as CRED_<FIELD>, e.g. CRED_USER and CRED_SESSION.\n\
                             --from reads a key the browser keeps for a site after you sign in there, \
                             e.g. firefox:https://app.example.com#session_token. The value never \
                             leaves cred.")]
@@ -335,6 +336,19 @@ fn kc_get(res: &str, field: &str) -> Option<String> {
     get_generic_password(&service(res, field), &account())
         .ok()
         .map(|v| String::from_utf8_lossy(&v).into_owned())
+}
+
+/// Whether the item exists, without reading its value: only reading a value can make
+/// macOS ask for Keychain access, so status checks never prompt.
+fn kc_exists(res: &str, field: &str) -> bool {
+    ItemSearchOptions::new()
+        .class(ItemClass::generic_password())
+        .service(&service(res, field))
+        .account(&account())
+        .load_attributes(true)
+        .limit(Limit::Max(1))
+        .search()
+        .is_ok_and(|r| !r.is_empty())
 }
 
 fn kc_set(res: &str, field: &str, value: &str) -> Result<()> {
@@ -602,10 +616,12 @@ fn refresh_one(res: &str, r: &Resource, field: &str, f: &Field) -> Result<()> {
     Ok(())
 }
 
-/// Run a refresh command with the resource's fields as CRED_<FIELD>; returns its stdout.
+/// Run a refresh command with the resource's internal fields as CRED_<FIELD>; returns its stdout.
 fn run_refresh_cmd(res: &str, r: &Resource, field: &str, cmd: &str) -> Result<String> {
     let mut command = Command::new("sh");
-    for name in r.fields.keys() {
+    // Inputs are the fields kept inside cred (login, session); exported fields are outputs,
+    // and skipping them saves a Keychain read (and possibly an access prompt) each.
+    for (name, _) in r.fields.iter().filter(|(_, f)| f.env.is_none()) {
         if let Some(v) = kc_get(res, name) {
             command.env(format!("CRED_{}", name.to_uppercase()), v);
         }
@@ -683,7 +699,7 @@ fn cmd_info(res: &str) -> Result<()> {
     println!("{:<12} {}", "url", r.url);
     println!("{:<12} {}", "description", r.description);
     for (name, f) in &r.fields {
-        let mut parts = vec![if kc_get(res, name).is_some() { "stored" } else { "MISSING" }.to_string()];
+        let mut parts = vec![if kc_exists(res, name) { "stored" } else { "MISSING" }.to_string()];
         parts.push(f.env.as_ref().map_or("inside cred".to_string(), |v| format!("exported as {v}")));
         if let Some(t) = f.expiry_text() {
             parts.push(format!("expires {t}"));
@@ -701,7 +717,7 @@ fn cmd_info(res: &str) -> Result<()> {
 
 /// A field's status label and how urgent it is (higher = worse), for picking a resource's status.
 fn field_status(res: &str, name: &str, f: &Field, warn: i64) -> (i64, String) {
-    if kc_get(res, name).is_none() {
+    if !kc_exists(res, name) {
         return (i64::MAX, "MISSING".into());
     }
     if f.expired() {
