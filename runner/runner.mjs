@@ -223,6 +223,17 @@ const commands = {
   },
   // Enter can submit a form or follow a link; other keys rarely change what the page says.
   press: ({ key }) => (/(^|\+)Enter$/.test(key) ? acting(() => page.keyboard.press(key)) : page.keyboard.press(key).then(() => describe())),
+  // Types a stored credential (cred sends it as `value`) into a field. The page, and the frame
+  // holding the field, must be on one of the policy's origins.
+  async fill({ ref, value }) {
+    const target = locate(ref);
+    const frame = await (await target.elementHandle({ timeout: 5_000 })).ownerFrame();
+    for (const f of [page.mainFrame(), frame]) {
+      if (!allowed(config.origins, originOf(f?.url() ?? ''))) throw new Error("this page isn't on the site's own origin, so cred won't type a credential into it");
+    }
+    await target.fill(value, { timeout: 10_000 });
+    return describe();
+  },
   async back() {
     await page.goBack({ timeout: 15_000 });
     return describe();
@@ -253,7 +264,9 @@ rl.on('line', async (line) => {
     send({ id: msg.id, ok: true, text: await run(msg) });
   } catch (e) {
     // Playwright errors carry terminal colors and long call logs; keep the gist.
-    const text = String(e?.message ?? e).replace(/\u001b\[[0-9;]*m/g, '');
+    let text = String(e?.message ?? e).replace(/\u001b\[[0-9;]*m/g, '');
+    // A credential cred was asked to type must not come back in an error.
+    if (msg.value) text = text.replaceAll(msg.value, '********');
     send({ id: msg.id, ok: false, error: text.split('\n').slice(0, 3).join('\n') });
   }
   if (msg.cmd === 'close') process.exit(0);

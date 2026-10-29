@@ -44,8 +44,6 @@ dir, no reading the home folder beyond what the browser needs.
 
 - Encrypted session vault: capture the browser's updated cookies/storage on `browse_close` and
   store them encrypted (key in the Keychain), so sessions the site rotates aren't lost.
-- `browse_fill_credential(ref, field)`: cred types a stored login into the page itself, only on
-  the site's own origin, for sites without a session to inject.
 
 ## 8. Small things
 

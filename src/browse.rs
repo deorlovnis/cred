@@ -136,6 +136,17 @@ impl Session {
     }
 }
 
+/// The command that types one of the site's stored fields into a page, as far as the approved
+/// policy lets cred. The runner only types it on the policy's own origins.
+pub fn fill_command(site: &str, approved: &Approved, element: &str, field: &str) -> Result<Value> {
+    let allowed = approved.policy.browse.as_ref().is_some_and(|b| b.fill.iter().any(|f| f == field));
+    if !allowed {
+        bail!("the policy for {site} doesn't let cred type {field} into pages (list it in [browse] fill)");
+    }
+    let value = keychain::get(site, field).ok_or_else(|| anyhow!("{site}/{field} isn't stored"))?;
+    Ok(json!({ "cmd": "fill", "ref": element, "value": value }))
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         let _ = writeln!(self.stdin, "{}", json!({ "id": 0, "cmd": "close" }));

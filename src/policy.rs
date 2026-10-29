@@ -132,6 +132,10 @@ pub struct Browse {
     /// Lets the agent take screenshots. Masking can't reach text inside an image.
     #[serde(default)]
     pub screenshots: bool,
+    /// Fields (a login's user and password) cred may type into pages on the origins, for
+    /// sites without a session to inject. Off unless listed.
+    #[serde(default)]
+    pub fill: Vec<String>,
 }
 
 /// A cookie set from a stored field, e.g. the session token.
@@ -250,6 +254,12 @@ impl Browse {
             if !domain.contains('.') || !origins.iter().any(|s| s.covers_cookie(&domain)) {
                 bail!("[browse] cookie {} domain '{}' doesn't cover one of the origins", c.name, c.domain);
             }
+        }
+        for field in &self.fill {
+            parse_field(field).map_err(|e| anyhow!("[browse] fill '{field}': {e}"))?;
+        }
+        if !self.fill.is_empty() && origins.iter().any(|s| matches!(s, Site::Any)) {
+            bail!("[browse] fill can't be used with origins = [\"*\"]: name the sites cred may type credentials into");
         }
         for s in &self.local_storage {
             parse_field(&s.field).map_err(|e| anyhow!("[browse] local_storage {}: field: {e}", s.key))?;
@@ -676,6 +686,7 @@ mod tests {
         start = "https://app.example.com/home"
         cookies = [{ name = "session", field = "token", domain = ".example.com" }]
         local_storage = [{ origin = "https://app.example.com", key = "jwt", field = "token" }]
+        fill = ["user", "password"]
     "#;
 
     #[test]
@@ -708,6 +719,8 @@ mod tests {
             ("[browse]\norigins = [\"https://a.example.com\"]\nallow_writes = [\"https://evil.com/x\"]", "allowed host"),
             ("[browse]\norigins = [\"https://*.com\"]", "like https://*.example.com"),
             ("[browse]\norigins = [\"ftp://*.example.com\"]", "like https://*.example.com"),
+            ("[browse]\norigins = [\"*\"]\nfill = [\"password\"]", "name the sites"),
+            ("[browse]\norigins = [\"https://a.example.com\"]\nfill = [\"_policy\"]", "fill '_policy'"),
         ];
         for (text, why) in bad {
             let err = format!("{:#}", Policy::parse(text).err().unwrap_or_else(|| panic!("accepted: {text}")));
