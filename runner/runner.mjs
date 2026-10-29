@@ -26,6 +26,19 @@ function originOf(url) {
   }
 }
 
+// A site rule: "*" (any https site), "https://*.example.com" (the domain and its subdomains),
+// or an exact origin.
+function allowed(list, origin) {
+  if (!origin) return false;
+  return list.some((site) => {
+    if (site === '*') return origin.startsWith('https://');
+    const wild = site.match(/^(https?):\/\/\*\.(.+)$/);
+    if (!wild) return site === origin;
+    const u = new URL(origin);
+    return u.protocol === `${wild[1]}:` && (u.hostname === wild[2] || u.hostname.endsWith(`.${wild[2]}`));
+  });
+}
+
 function note(text) {
   if (notes.length < 30 && !notes.includes(text)) notes.push(text);
 }
@@ -42,8 +55,8 @@ async function guard(route) {
   const url = req.url();
   const origin = originOf(url);
   const mainFrameNavigation = req.isNavigationRequest() && req.frame() === page?.mainFrame();
-  const allowed = mainFrameNavigation ? config.origins : config.origins.concat(config.requests);
-  if (!origin || !allowed.includes(origin)) {
+  const sites = mainFrameNavigation ? config.origins : config.origins.concat(config.requests);
+  if (!allowed(sites, origin)) {
     note(`blocked ${req.method()} ${url.slice(0, 120)} (host not allowed)`);
     return route.abort('blockedbyclient');
   }
@@ -85,7 +98,7 @@ const commands = {
     });
     await context.route('**/*', guard);
     await context.routeWebSocket(/.*/, (ws) => {
-      if (config.origins.concat(config.requests).includes(originOf(ws.url()))) return ws.connectToServer();
+      if (allowed(config.origins.concat(config.requests), originOf(ws.url()))) return ws.connectToServer();
       note(`blocked websocket ${ws.url().slice(0, 120)}`);
       ws.close();
     });
@@ -104,11 +117,18 @@ const commands = {
     return describe();
   },
   async goto({ url }) {
-    if (!config.origins.includes(originOf(url))) throw new Error(`${originOf(url) ?? url} isn't one of the pages this site allows`);
+    if (!allowed(config.origins, originOf(url))) throw new Error(`${originOf(url) ?? url} isn't one of the pages this site allows`);
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     return describe();
   },
   snapshot: () => describe(),
+  // The image goes back to cred in memory; nothing is written to disk.
+  async screenshot({ full_page }) {
+    if (!config.screenshots) throw new Error("this site's policy doesn't allow screenshots");
+    await settle();
+    const image = await page.screenshot({ type: 'jpeg', quality: 70, fullPage: full_page === true, timeout: 15_000 });
+    return JSON.stringify({ url: page.url(), jpeg: image.toString('base64') });
+  },
   async click({ ref }) {
     await locate(ref).click({ timeout: 5_000 });
     return describe();

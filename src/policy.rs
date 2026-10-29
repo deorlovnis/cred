@@ -129,6 +129,9 @@ pub struct Browse {
     pub cookies: Vec<BrowseCookie>,
     #[serde(default)]
     pub local_storage: Vec<BrowseStorage>,
+    /// Lets the agent take screenshots. Masking can't reach text inside an image.
+    #[serde(default)]
+    pub screenshots: bool,
 }
 
 /// A cookie set from a stored field, e.g. the session token.
@@ -149,50 +152,109 @@ pub struct BrowseStorage {
     pub field: String,
 }
 
+/// A site the browser may use: an exact origin, "https://*.example.com" (that domain and its
+/// subdomains), or "*" (any https site).
+enum Site {
+    Any,
+    Domain { scheme: String, domain: String },
+    Exact(String),
+}
+
+impl Site {
+    fn parse(entry: &str) -> Result<Self> {
+        if entry == "*" {
+            return Ok(Site::Any);
+        }
+        if let Some((scheme, rest)) = entry.split_once("://*.") {
+            let domain = rest.trim_end_matches('/');
+            if !matches!(scheme, "https" | "http") || !domain.contains('.') || domain.contains(['/', ':', '*', '@']) {
+                bail!("must be like https://*.example.com");
+            }
+            return Ok(Site::Domain { scheme: scheme.into(), domain: domain.to_ascii_lowercase() });
+        }
+        Ok(Site::Exact(host_origin(entry)?))
+    }
+
+    /// The form the browser runner matches against.
+    fn text(&self) -> String {
+        match self {
+            Site::Any => "*".into(),
+            Site::Domain { scheme, domain } => format!("{scheme}://*.{domain}"),
+            Site::Exact(origin) => origin.clone(),
+        }
+    }
+
+    fn matches(&self, origin: &str) -> bool {
+        match self {
+            Site::Any => origin.starts_with("https://"),
+            Site::Exact(o) => o == origin,
+            Site::Domain { scheme, domain } => Url::parse(origin).is_ok_and(|u| {
+                u.scheme() == scheme && u.host_str().is_some_and(|h| h == domain || h.ends_with(&format!(".{domain}")))
+            }),
+        }
+    }
+
+    /// Whether a cookie for this domain is meant for this site.
+    fn covers_cookie(&self, cookie_domain: &str) -> bool {
+        let inside = |host: &str| host == cookie_domain || host.ends_with(&format!(".{cookie_domain}"));
+        match self {
+            Site::Any => true,
+            Site::Exact(o) => Url::parse(o).is_ok_and(|u| u.host_str().is_some_and(inside)),
+            Site::Domain { domain, .. } => inside(domain) || cookie_domain.ends_with(&format!(".{domain}")),
+        }
+    }
+}
+
+fn sites(entries: &[String]) -> Vec<Site> {
+    entries.iter().filter_map(|e| Site::parse(e).ok()).collect()
+}
+
 impl Browse {
     pub fn origins(&self) -> Vec<String> {
-        self.origins.iter().filter_map(|h| host_origin(h).ok()).collect()
+        sites(&self.origins).iter().map(Site::text).collect()
     }
 
     pub fn requests(&self) -> Vec<String> {
-        self.requests.iter().filter_map(|h| host_origin(h).ok()).collect()
+        sites(&self.requests).iter().map(Site::text).collect()
     }
 
     fn validate(&self) -> Result<()> {
         if self.origins.is_empty() {
             bail!("[browse] origins is empty");
         }
-        for host in self.origins.iter().chain(&self.requests) {
-            host_origin(host).map_err(|e| anyhow!("[browse] '{host}': {e}"))?;
+        for entry in self.origins.iter().chain(&self.requests) {
+            Site::parse(entry).map_err(|e| anyhow!("[browse] '{entry}': {e}"))?;
         }
-        let (origins, all) = (self.origins(), [self.origins(), self.requests()].concat());
+        let origins = sites(&self.origins);
+        let all: Vec<Site> = sites(&self.origins).into_iter().chain(sites(&self.requests)).collect();
         let origin_of = |raw: &str| Url::parse(raw).map_err(|e| anyhow!("{e}")).and_then(|u| url_origin(&u));
         for prefix in &self.allow_writes {
-            if !all.contains(&origin_of(prefix).map_err(|e| anyhow!("[browse] allow_writes '{prefix}': {e}"))?) {
+            let origin = origin_of(prefix).map_err(|e| anyhow!("[browse] allow_writes '{prefix}': {e}"))?;
+            if !all.iter().any(|s| s.matches(&origin)) {
                 bail!("[browse] allow_writes '{prefix}' isn't on an allowed host");
             }
         }
-        if let Some(start) = &self.start
-            && !origins.contains(&origin_of(start).map_err(|e| anyhow!("[browse] start: {e}"))?)
-        {
-            bail!("[browse] start must be on one of the origins");
+        if let Some(start) = &self.start {
+            let origin = origin_of(start).map_err(|e| anyhow!("[browse] start: {e}"))?;
+            if !origins.iter().any(|s| s.matches(&origin)) {
+                bail!("[browse] start must be on one of the origins");
+            }
         }
-        let hosts: Vec<String> = origins.iter().filter_map(|o| Url::parse(o).ok()?.host_str().map(str::to_string)).collect();
         for c in &self.cookies {
             parse_field(&c.field).map_err(|e| anyhow!("[browse] cookie {}: field: {e}", c.name))?;
             if c.name.is_empty() || !c.name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
                 bail!("[browse] cookie name '{}' isn't valid", c.name);
             }
-            // The cookie may only be as wide as the sites the browser may open.
-            let domain = c.domain.trim_start_matches('.');
-            let fits = domain.contains('.') && hosts.iter().any(|h| h == domain || h.ends_with(&format!(".{domain}")));
-            if !fits {
+            // The cookie must be meant for the sites the browser may open.
+            let domain = c.domain.trim_start_matches('.').to_ascii_lowercase();
+            if !domain.contains('.') || !origins.iter().any(|s| s.covers_cookie(&domain)) {
                 bail!("[browse] cookie {} domain '{}' doesn't cover one of the origins", c.name, c.domain);
             }
         }
         for s in &self.local_storage {
             parse_field(&s.field).map_err(|e| anyhow!("[browse] local_storage {}: field: {e}", s.key))?;
-            if !origins.contains(&host_origin(&s.origin).map_err(|e| anyhow!("[browse] local_storage origin: {e}"))?) {
+            let origin = host_origin(&s.origin).map_err(|e| anyhow!("[browse] local_storage origin: {e}"))?;
+            if !origins.iter().any(|site| site.matches(&origin)) {
                 bail!("[browse] local_storage origin '{}' isn't one of the origins", s.origin);
             }
         }
@@ -628,11 +690,25 @@ mod tests {
             ("[browse]\norigins = [\"https://a.example.com\"]\ncookies = [{ name = \"s\", field = \"token\", domain = \"other.com\" }]", "doesn't cover"),
             ("[browse]\norigins = [\"https://a.example.com\"]\nstart = \"https://b.example.com/\"", "start"),
             ("[browse]\norigins = [\"https://a.example.com\"]\nallow_writes = [\"https://evil.com/x\"]", "allowed host"),
+            ("[browse]\norigins = [\"https://*.com\"]", "like https://*.example.com"),
+            ("[browse]\norigins = [\"ftp://*.example.com\"]", "like https://*.example.com"),
         ];
         for (text, why) in bad {
             let err = format!("{:#}", Policy::parse(text).err().unwrap_or_else(|| panic!("accepted: {text}")));
             assert!(err.contains(why), "{text}: {err}");
         }
+    }
+
+    #[test]
+    fn matches_browse_sites() {
+        let any = Site::parse("*").unwrap();
+        let dom = Site::parse("https://*.example.com").unwrap();
+        assert!(any.matches("https://anything.org") && !any.matches("http://anything.org"));
+        assert!(dom.matches("https://example.com") && dom.matches("https://a.b.example.com"));
+        assert!(!dom.matches("https://notexample.com") && !dom.matches("http://a.example.com"));
+        assert!(dom.covers_cookie("example.com") && dom.covers_cookie("app.example.com") && !dom.covers_cookie("other.com"));
+        let p = Policy::parse("[browse]\norigins = [\"https://*.example.com\"]\nrequests = [\"*\"]\nstart = \"https://app.example.com/\"\nscreenshots = true\ncookies = [{ name = \"s\", field = \"token\", domain = \".example.com\" }]").unwrap();
+        assert_eq!(p.browse.unwrap().requests(), ["*"]);
     }
 
     #[test]

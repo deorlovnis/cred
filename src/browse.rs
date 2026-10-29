@@ -71,6 +71,7 @@ impl Session {
             "start": browse.start,
             "cookies": cookies,
             "storage": storage,
+            "screenshots": browse.screenshots,
         });
 
         let script = runner_dir().join("runner.mjs");
