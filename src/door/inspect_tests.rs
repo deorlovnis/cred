@@ -12,15 +12,17 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use anyhow::bail;
 use serde_json::{Value, json};
 
 use super::addr::Net as Dial;
 use super::http::{self, Body, Head};
-use super::inspect::{Ctx, Net, serve};
+use super::inspect::{Ctx, Net, RETRY_BODY, serve};
 use super::{Config, Shared};
 use crate::chain::Chain;
 use crate::policy::{self, Mode};
@@ -126,6 +128,18 @@ fn respond(seen: &Seen, out: &mut UnixStream, released: &Mutex<Receiver<()>>) {
             write!(out, "0\r\n\r\n").unwrap();
         }
         (_, "/gzip") => out.write_all(b"HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\ncontent-length: 4\r\n\r\n\x1f\x8b\x08\x00").unwrap(),
+        // The site closes the connection after answering, without saying so.
+        (_, "/once") => {
+            whole(out, "", "plain page");
+            out.flush().unwrap();
+            out.shutdown(Shutdown::Both).unwrap();
+        }
+        // The site starts an answer and dies.
+        (_, "/partial") => {
+            out.write_all(b"HTTP/1.1 200 OK\r\ncon").unwrap();
+            out.flush().unwrap();
+            out.shutdown(Shutdown::Both).unwrap();
+        }
         (_, "/close") => {
             write!(out, "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\r\nclosing {SECRET}").unwrap();
             out.flush().unwrap();
@@ -142,32 +156,51 @@ struct Rig {
     guest: Conn,
     seen: Arc<Mutex<Vec<Seen>>>,
     release: Sender<()>,
+    /// How many connections the door made to the site.
+    connects: Arc<AtomicUsize>,
+    /// While set, the door can't connect to the site.
+    unreachable: Arc<AtomicBool>,
     serving: JoinHandle<(u64, u64)>,
 }
 
 impl Rig {
     fn new(shared: &Arc<Shared>, host: &str) -> Self {
         let (guest, door_guest) = UnixStream::pair().unwrap();
-        let (door_upstream, site) = UnixStream::pair().unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let (release, released) = mpsc::channel();
-        let (record, released) = (seen.clone(), Mutex::new(released));
-        thread::spawn(move || {
-            let mut reader = BufReader::new(site.try_clone().unwrap());
-            let mut out = site;
-            while let Ok(Some(head)) = http::read_head(&mut reader) {
-                let framing = http::request_framing(&head).unwrap();
-                let mut body = Vec::new();
-                Body::new(&mut reader, framing).read_to_end(&mut body).unwrap();
-                let seen = Seen { line: head.line.clone(), headers: head.headers.clone(), body };
-                record.lock().unwrap().push(seen.clone());
-                respond(&seen, &mut out, &released);
+        let released = Arc::new(Mutex::new(released));
+        let (connects, unreachable) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
+        // Each connection the door makes gets a site of its own; they all record into `seen`.
+        let (record, count, down) = (seen.clone(), connects.clone(), unreachable.clone());
+        let connect = move || {
+            if down.load(Ordering::SeqCst) {
+                bail!("no route to the site");
             }
-        });
+            count.fetch_add(1, Ordering::SeqCst);
+            let (door_upstream, site) = UnixStream::pair().unwrap();
+            let (record, released) = (record.clone(), released.clone());
+            thread::spawn(move || {
+                let mut reader = BufReader::new(site.try_clone().unwrap());
+                let mut out = site;
+                while let Ok(Some(head)) = http::read_head(&mut reader) {
+                    let framing = http::request_framing(&head).unwrap();
+                    let mut body = Vec::new();
+                    Body::new(&mut reader, framing).read_to_end(&mut body).unwrap();
+                    let seen = Seen { line: head.line.clone(), headers: head.headers.clone(), body };
+                    record.lock().unwrap().push(seen.clone());
+                    respond(&seen, &mut out, &released);
+                }
+            });
+            Ok(door_upstream)
+        };
         let (shared, host) = (shared.clone(), host.to_string());
-        let serving = thread::spawn(move || serve(door_guest, door_upstream, &Ctx { shared: &shared, host: &host }));
+        let serving = thread::spawn(move || serve(door_guest, connect, &Ctx { shared: &shared, host: &host }));
         guest.set_read_timeout(Some(WAIT)).unwrap();
-        Self { guest: Conn { reader: BufReader::new(guest.try_clone().unwrap()), stream: guest, seen: Vec::new() }, seen, release, serving }
+        Self { guest: Conn { reader: BufReader::new(guest.try_clone().unwrap()), stream: guest, seen: Vec::new() }, seen, release, connects, unreachable, serving }
+    }
+
+    fn connects(&self) -> usize {
+        self.connects.load(Ordering::SeqCst)
     }
 
     fn reached(&self) -> Vec<Seen> {
@@ -318,6 +351,7 @@ fn scenario(dir: &Path, yes: bool) {
     let deny = shared(dir, "deny", Mode::Deny, &["https://free.example.com/hook"]);
     other_hosts(&deny);
     site_hosts(&deny, yes);
+    the_site_closes_idle_connections(&deny);
     net_asks(&shared(dir, "ask", Mode::Ask, &[]), yes);
     net_allows(&shared(dir, "allow", Mode::Allow, &[]));
     the_log_chains(dir, yes);
@@ -566,6 +600,65 @@ fn site_hosts(sh: &Arc<Shared>, yes: bool) {
     let mut rig = Rig::new(sh, ro);
     rig.guest.get(ro, "/plain", &[]);
     assert_eq!(rig.reached()[0].header("authorization"), None);
+    rig.finish();
+}
+
+/// The site closes connections the door keeps for it; the door makes a new one, once, and only
+/// when nothing of an answer has arrived.
+fn the_site_closes_idle_connections(sh: &Arc<Shared>) {
+    // Hosts of a site that allows writes, so a request with a body can be sent again too.
+    let host = "app.example.com";
+    let mut rig = Rig::new(sh, host);
+    assert_eq!(rig.connects(), 0, "the door connects when a request needs it");
+    assert_eq!(rig.guest.get(host, "/once", &[]).1, "plain page");
+    assert_eq!(rig.connects(), 1);
+    let (reply, body) = rig.guest.get(host, "/plain", &[]);
+    assert_eq!((reply.status, body.as_str()), (200, "plain page"), "the next request goes over a new connection");
+    assert_eq!(rig.connects(), 2);
+    assert_eq!(rig.reached().len(), 2);
+    // A body that was kept is sent again, with the site's credential, in the framing it came in.
+    assert_eq!(rig.guest.get(host, "/once", &[]).0.status, 200);
+    let (reply, body) = rig.guest.post(host, "/submit", &[], "payload");
+    assert_eq!((reply.status, body.as_str()), (200, "got payload"));
+    assert_eq!(rig.connects(), 3);
+    let seen = rig.reached();
+    assert_eq!(seen.iter().filter(|s| s.target() == "/submit").count(), 1, "it reached the site once: the first try died with the connection");
+    assert_eq!(seen.last().unwrap().header("authorization"), Some(format!("Bearer {SECRET}").as_str()));
+    assert_eq!(rig.guest.get(host, "/once", &[]).0.status, 200);
+    rig.guest.send("POST /submit HTTP/1.1\r\nHost: app.example.com\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n");
+    let reply = rig.guest.head();
+    assert_eq!((reply.status, rig.guest.body(&reply).as_str()), (200, "got abcdef"));
+    assert_eq!(rig.connects(), 4);
+
+    // A body too big to have been kept isn't sent again: the request fails.
+    assert_eq!(rig.guest.get(host, "/once", &[]).0.status, 200);
+    let big = "x".repeat(RETRY_BODY + 1);
+    let (reply, body) = rig.guest.post(host, "/submit", &[], &big);
+    assert_eq!(reply.status, 502, "{body}");
+    assert!(body.contains("couldn't send"), "{body}");
+    assert_eq!(rig.connects(), 4, "no new connection for a request that can't be sent again");
+    assert!(rig.guest.closed());
+    rig.finish();
+
+    // Once any of an answer has arrived, nothing is sent again.
+    let mut rig = Rig::new(sh, host);
+    assert_eq!(rig.guest.get(host, "/plain", &[]).0.status, 200);
+    let (reply, body) = rig.guest.get(host, "/partial", &[]);
+    assert_eq!(reply.status, 502, "{body}");
+    assert_eq!(rig.reached().iter().filter(|s| s.target() == "/partial").count(), 1);
+    assert_eq!(rig.connects(), 1);
+    rig.finish();
+
+    // A connection that can't be made is a 502, and a refused request needs none at all.
+    let mut rig = Rig::new(sh, host);
+    rig.unreachable.store(true, Ordering::SeqCst);
+    let (reply, body) = rig.guest.get(host, "/plain", &[]);
+    assert_eq!(reply.status, 502);
+    assert!(body.contains("couldn't connect"), "{body}");
+    rig.finish();
+    let mut rig = Rig::new(sh, "web.example.com");
+    assert_eq!(rig.guest.post("web.example.com", "/submit", &[], "x").0.status, 403);
+    assert_eq!(rig.connects(), 0, "a refused request never reaches the site, not even to connect");
     rig.finish();
 }
 

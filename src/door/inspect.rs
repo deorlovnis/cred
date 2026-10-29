@@ -61,15 +61,22 @@ pub(super) struct Ctx<'a> {
     pub host: &'a str,
 }
 
-/// Serve requests from the guest (TLS already ended) to the upstream (already connected, TLS
-/// verified) until either side closes. Returns the request body bytes sent up and the response
-/// body bytes received (before masking), over every request.
+/// A request body this small is kept while it is sent, so the request can be sent again if the
+/// site turns out to have closed the connection.
+pub(super) const RETRY_BODY: usize = 1024 * 1024;
+
+/// Serve requests from the guest (TLS already ended) until it closes. `connect` makes the
+/// connection to the site (verified TLS to the vetted address); it is called when the first
+/// request that is let through needs it, and again if the site has closed the connection by the
+/// time a later request uses it (see `call_site`). Returns the request body bytes sent up and the
+/// response body bytes received (before masking), over every request.
 #[allow(dead_code)] // proxy.rs calls this once TLS ends at the door
-pub(super) fn serve<G: Read + Write, U: Read + Write>(guest: G, upstream: U, ctx: &Ctx) -> (u64, u64) {
-    let (mut guest, mut upstream) = (BufReader::new(guest), BufReader::new(upstream));
+pub(super) fn serve<G: Read + Write, U: Read + Write>(guest: G, mut connect: impl FnMut() -> Result<U>, ctx: &Ctx) -> (u64, u64) {
+    let mut guest = BufReader::new(guest);
+    let mut upstream: Option<BufReader<U>> = None;
     let mut counts = Counts::default();
     while !ctx.shared.stopped() {
-        if !matches!(exchange(&mut guest, &mut upstream, ctx, &mut counts), Ok(true)) {
+        if !matches!(exchange(&mut guest, &mut upstream, &mut connect, ctx, &mut counts), Ok(true)) {
             break;
         }
     }
@@ -259,7 +266,13 @@ fn decide(sh: &Shared, kind: Kind, site: Option<&Site>, method: &str, host: &str
 }
 
 /// One request and its answer. `Ok(true)` if the connection can serve another.
-fn exchange<G: Read + Write, U: Read + Write>(guest: &mut BufReader<G>, upstream: &mut BufReader<U>, ctx: &Ctx, counts: &mut Counts) -> io::Result<bool> {
+fn exchange<G: Read + Write, U: Read + Write>(
+    guest: &mut BufReader<G>,
+    upstream: &mut Option<BufReader<U>>,
+    connect: &mut impl FnMut() -> Result<U>,
+    ctx: &Ctx,
+    counts: &mut Counts,
+) -> io::Result<bool> {
     let sh = ctx.shared;
     let plain = Masker::new([]);
     // The log line has this request's bytes, not the connection's so far.
@@ -321,23 +334,15 @@ fn exchange<G: Read + Write, U: Read + Write>(guest: &mut BufReader<G>, upstream
         guest.get_mut().write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
         guest.get_mut().flush()?;
     }
-    let sent = forward_request(guest, upstream, &head, method, target, framing, site.as_ref(), &mut counts.up);
-    if let Err(e) = sent {
-        sh.log.write(&entry(&method_shown, &url, Some(502), &format!("failed:upstream: {}", e.kind()), counts));
-        return end_with_message(guest, 502, "cred couldn't send the request to the site");
-    }
-
-    // The answer.
-    let answer = loop {
-        match http::read_head(upstream) {
-            Ok(Some(h)) if h.status().is_some_and(|s| (100..200).contains(&s)) && h.status() != Some(101) => continue,
-            Ok(Some(h)) if h.status().is_some() && h.status() != Some(101) => break h,
-            _ => {
-                sh.log.write(&entry(&method_shown, &url, Some(502), "failed:upstream", counts));
-                return end_with_message(guest, 502, "the site gave no usable answer");
-            }
+    let answer = match call_site(guest, upstream, connect, &head, method, target, framing, site.as_ref(), &mut counts.up) {
+        Ok(answer) => answer,
+        Err(Failure::Guest(e)) => return Err(e),
+        Err(Failure::Site { decision, message }) => {
+            sh.log.write(&entry(&method_shown, &url, Some(502), decision, counts));
+            return end_with_message(guest, 502, message);
         }
     };
+    let upstream = upstream.as_mut().expect("call_site left a connection");
     let status = answer.status().unwrap_or(502);
     let Ok(answer_framing) = http::response_framing(&answer, method, status) else {
         sh.log.write(&entry(&method_shown, &url, Some(502), "failed:upstream", counts));
@@ -420,21 +425,137 @@ fn request_headers(head: &Head, framing: Framing, method: &str, site: Option<&Si
     out
 }
 
-/// Send the request to the site, its body streamed as it arrives from the guest.
+/// Why a request got no answer from the site.
+enum Failure {
+    /// The guest's side broke: nothing more can be said to it.
+    Guest(io::Error),
+    Site { decision: &'static str, message: &'static str },
+}
+
+fn site_failure(decision: &'static str, message: &'static str) -> Failure {
+    Failure::Site { decision, message }
+}
+
+/// What the site sent first, if anything.
+enum Answer {
+    Head(Head),
+    /// The connection ended before a single byte of an answer: the site had closed it.
+    Gone,
+    /// Something arrived, but no answer that can be used.
+    Broken,
+}
+
+fn read_answer<U: Read + Write>(upstream: &mut BufReader<U>) -> Answer {
+    let mut interim = false;
+    loop {
+        match http::read_head(upstream) {
+            Ok(Some(h)) if h.status().is_some_and(|s| (100..200).contains(&s)) && h.status() != Some(101) => interim = true,
+            Ok(Some(h)) if h.status().is_some() && h.status() != Some(101) => return Answer::Head(h),
+            Ok(None) if !interim => return Answer::Gone,
+            Err(e) if !interim && matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted | io::ErrorKind::BrokenPipe | io::ErrorKind::NotConnected) => return Answer::Gone,
+            _ => return Answer::Broken,
+        }
+    }
+}
+
+/// The request body as far as it was kept for a second try.
+#[derive(Default)]
+struct Kept {
+    data: Vec<u8>,
+    /// More than `RETRY_BODY`: it can't be sent again.
+    overflow: bool,
+}
+
+impl Kept {
+    fn push(&mut self, piece: &[u8]) {
+        if self.overflow {
+            return;
+        }
+        if self.data.len() + piece.len() > RETRY_BODY {
+            self.overflow = true;
+            self.data = Vec::new();
+        } else {
+            self.data.extend_from_slice(piece);
+        }
+    }
+}
+
+/// Send the request to the site and read the start of its answer. The connection is made here
+/// if there is none. If it was in use before and turns out to have been closed by the site, with
+/// no byte of an answer, the request is sent once more on a new connection, as long as the whole
+/// body was kept. Nothing is sent again once any of an answer has arrived.
 #[allow(clippy::too_many_arguments)]
-fn forward_request<G: Read + Write, U: Read + Write>(
+fn call_site<G: Read + Write, U: Read + Write>(
     guest: &mut BufReader<G>,
-    upstream: &mut BufReader<U>,
+    upstream: &mut Option<BufReader<U>>,
+    connect: &mut impl FnMut() -> Result<U>,
     head: &Head,
     method: &str,
     target: &str,
     framing: Framing,
     site: Option<&Site>,
     sent: &mut u64,
-) -> io::Result<()> {
-    let out = upstream.get_mut();
-    http::write_head(out, &format!("{method} {target} HTTP/1.1"), &request_headers(head, framing, method, site))?;
-    out.flush()?;
+) -> Result<Head, Failure> {
+    let mut dial = |upstream: &mut Option<BufReader<U>>| match connect() {
+        Ok(stream) => {
+            *upstream = Some(BufReader::new(stream));
+            Ok(())
+        }
+        Err(_) => Err(site_failure("failed:connect", "cred couldn't connect to the site")),
+    };
+    let reused = upstream.is_some();
+    if !reused {
+        dial(upstream)?;
+    }
+    let (line, headers) = (format!("{method} {target} HTTP/1.1"), request_headers(head, framing, method, site));
+    let mut kept = Kept::default();
+    let conn = upstream.as_mut().expect("connected");
+    let delivered = stream_request(guest, conn.get_mut(), &line, &headers, framing, sent, &mut kept).map_err(Failure::Guest)?;
+    match read_answer(conn) {
+        Answer::Head(answer) => return Ok(answer),
+        Answer::Gone if reused && !kept.overflow => {}
+        Answer::Gone | Answer::Broken => {
+            let message = if delivered { "the site gave no usable answer" } else { "cred couldn't send the request to the site" };
+            return Err(site_failure("failed:upstream", message));
+        }
+    }
+    // The site had closed the connection while it sat idle: a new one, and the same request.
+    dial(upstream)?;
+    let conn = upstream.as_mut().expect("connected");
+    let again = http::write_head(conn.get_mut(), &line, &headers).and_then(|()| write_body(conn.get_mut(), framing, &kept.data));
+    match again {
+        Ok(()) => match read_answer(conn) {
+            Answer::Head(answer) => Ok(answer),
+            _ => Err(site_failure("failed:upstream", "the site gave no usable answer")),
+        },
+        Err(_) => Err(site_failure("failed:upstream", "cred couldn't send the request to the site")),
+    }
+}
+
+/// The body of a request, all at once (for sending it again).
+fn write_body(out: &mut impl Write, framing: Framing, data: &[u8]) -> io::Result<()> {
+    if framing == Framing::Chunked {
+        http::write_chunk(out, data)?;
+        out.write_all(b"0\r\n\r\n")?;
+    } else {
+        out.write_all(data)?;
+    }
+    out.flush()
+}
+
+/// Send the request, its body streamed as it arrives from the guest, and keep the body if it is
+/// small. `Ok(false)` if the site's side broke: the body is then read to its end if it can be
+/// kept, so the request can be sent again. `Err` if the guest's side broke.
+fn stream_request<G: Read + Write>(
+    guest: &mut BufReader<G>,
+    out: &mut impl Write,
+    line: &str,
+    headers: &[(String, String)],
+    framing: Framing,
+    sent: &mut u64,
+    kept: &mut Kept,
+) -> io::Result<bool> {
+    let mut ok = http::write_head(out, line, headers).and_then(|()| out.flush()).is_ok();
     let mut body = Body::new(guest, framing);
     let mut buf = [0u8; 16 * 1024];
     loop {
@@ -447,17 +568,20 @@ fn forward_request<G: Read + Write, U: Read + Write>(
             break;
         }
         *sent += n as u64;
-        if framing == Framing::Chunked {
-            http::write_chunk(out, &buf[..n])?;
-        } else {
-            out.write_all(&buf[..n])?;
+        kept.push(&buf[..n]);
+        if ok {
+            let piece = if framing == Framing::Chunked { http::write_chunk(out, &buf[..n]) } else { out.write_all(&buf[..n]) };
+            ok = piece.and_then(|()| out.flush()).is_ok();
         }
-        out.flush()?;
+        if !ok && kept.overflow {
+            // Nothing can be done with the rest of the body.
+            return Ok(false);
+        }
     }
-    if framing == Framing::Chunked {
-        out.write_all(b"0\r\n\r\n")?;
+    if ok && framing == Framing::Chunked {
+        ok = out.write_all(b"0\r\n\r\n").is_ok();
     }
-    out.flush()
+    Ok(ok && out.flush().is_ok())
 }
 
 /// How an answer's body goes to the guest.
