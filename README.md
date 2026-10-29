@@ -154,6 +154,57 @@ Writes that pages try without an `allow_writes` rule (a telemetry POST on every 
 
 A browser closes by itself after `idle_minutes` without a call, and `max_minutes` after it opened; the agent then needs `browse_open` again. A `browse_open` waits for your Touch ID when the site's first use in a session needs consent, so it can take as long as you take to answer.
 
+## Boxes
+
+A **box** is an isolated, encrypted place where an agent works: a Linux VM with no network of its own, whose only way out is a door cred keeps. The agent can do any work a person at a computer could (run code, install packages, keep files) but can't see your Mac, your Keychain or any credential. What it keeps is in an AES-256 store whose key lives in the Keychain; deleting the key destroys the box. Phase 1 (this section) covers boxes that reach listed sites; the open web with read-only rules, and the browser inside the box, come later.
+
+```sh
+cred box new research              # policy template in $EDITOR, a new key in the Keychain, an empty store
+cred box approve research          # Touch ID; until then the box can't open
+cred box run research              # Touch ID opens it; you're in Claude Code, inside the box
+cred box run research -- bash      # a shell in the same box (joins it if it's running)
+cred box run --temp research       # a throwaway box with research's policy, gone when it stops
+cred box ls                        # open or locked, policy status, size, sites, last used
+cred box log research              # what went through the door
+cred box export research work/report.md --to ~/Desktop   # Touch ID; lists each file with size and sha256
+cred box import research ~/data.csv                      # copy a file or folder into work/ (box stopped)
+cred box stop research             # stop and lock; also happens when `run` ends or on Ctrl-C
+cred box rm research               # Touch ID; deletes the key, then the store
+```
+
+`cred policy approve` with no names approves your boxes too, so `install.sh` still needs one Touch ID.
+
+`~/.config/cred/box/<name>.toml` (`CRED_BOX_DIR` overrides the folder):
+
+```toml
+about = "Market research"
+run = ["claude"]                        # what `cred box run` starts; `-- CMD` replaces it
+image = "cred-agent@sha256:..."         # the system inside, pinned by digest: a new image is a policy change
+model = "anthropic"                     # resource whose key cred adds to the agent's model calls
+sites = ["github", "app"]               # resources the agent may use through cred; their policies apply
+keep = true                             # false: a new store every run, shredded when it stops, key never kept
+cpus = 4
+memory = "8G"
+# docker = true                         # Docker Engine inside the box
+
+[net]
+allow = ["https://*.wikipedia.org", "https://docs.rs"]   # the only sites the agent's own requests reach; "*" = any public https site
+
+[[mount]]                               # holes in the box: none unless listed
+path = "~/Git/project"
+mode = "clone"                          # clone: the agent works on its own copy in work/ | ro: read-only at /mnt/project
+```
+
+- A box policy works like a resource policy: no effect until approved, a change blocks the box until approved again, and `cred box edit` shows a diff against the approved version. The approval is kept under the Keychain name `box.NAME` (resource names can't contain a dot, so it never collides with a resource).
+- One Touch ID at `run` opens the box and covers consent for its `sites`. Their own policies still decide hosts, writes and what may be browsed. `model` names a resource with a `[fetch]` policy: cred forwards the agent's model calls to its host with the real key, and the agent only has a stand-in. Joining a running box (`run NAME -- CMD` from another terminal) asks nothing more.
+- **Phase 1 limits.** The door sees host names, not requests: an allowed site gets whatever the agent sends it, so list sites you trust. `[net] writes` and `allow_writes` belong to phase 2 and `[browser]` to phase 3; the policy is refused if it sets them, rather than promising rules the door can't keep. `rw` mounts aren't offered: files come in with `clone` or `import` and go out with `export`.
+- Mounts: `clone` copies the folder (with its `.git`) into the box's `work/` on the first run, and the agent keeps its own copy after. `ro` mounts the folder itself read-only. Folders that hold cred's own files, your home folder and `/` are refused.
+- Inside, `/home/agent`, `/work` and `/downloads` are folders of the store; `/tmp` is memory. The agent starts in `/work`. On each run cred makes sure Claude Code's settings skip the web-fetch check and know cred's tools (`cred-shim mcp`), keeping anything else the agent put in those files.
+- The store is an APFS sparse bundle in `~/Library/Application Support/cred/box/`, opened with the key on `hdiutil`'s stdin into a private folder, hidden from Finder and Spotlight, and only while the box runs. A store never shrinks when files are deleted (`hdiutil compact` doesn't work on APFS images).
+- `export`, `import` and `rm` need the box stopped, because cred doesn't touch a folder a VM has mounted (and a running agent could swap a link in the folder while it is read). `export` copies regular files only, never follows links, and logs each file in the box's log. `log` reads an open box without asking.
+- `cred box rm` warns that Time Machine may still hold encrypted copies of the store; restored together with a Keychain from before the removal, which has the old key, they would open.
+- A crash leaves an attached store or a throwaway store behind; the next `run` or `stop` detaches and deletes them.
+
 ## What cred protects, and what it doesn't
 
 - **Protected:** values never reach the agent through cred. They stay in the Keychain, are added to requests by cred, are masked in everything cred returns, and refresh scripts run from approved bytes. Nothing loosens a policy or releases a value without Touch ID.
@@ -175,7 +226,7 @@ Deny direct Keychain and clipboard reads in `~/.claude/settings.json` too:
 ] } }
 ```
 
-Metadata (never values) is kept in `~/.config/cred/index.json`; `CRED_INDEX` overrides it, and `CRED_POLICY_DIR` the policy folder. `CRED_WARN_DAYS` sets the warning window.
+Metadata (never values) is kept in `~/.config/cred/index.json`; `CRED_INDEX` overrides it, and `CRED_POLICY_DIR` the policy folder, `CRED_BOX_DIR` the box policy folder. `CRED_WARN_DAYS` sets the warning window.
 
 ## Development
 

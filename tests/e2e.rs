@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::{env, fs, thread};
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 const CRED: &str = env!("CARGO_BIN_EXE_cred");
 const TOKEN: &str = "s3cret-token-value";
@@ -36,7 +37,7 @@ impl Env {
         static COUNT: AtomicUsize = AtomicUsize::new(0);
         let dir = env::temp_dir().join(format!("cred-e2e-{}-{}", std::process::id(), COUNT.fetch_add(1, Ordering::Relaxed)));
         let _ = fs::remove_dir_all(&dir);
-        for sub in ["keychain", "policy", "home"] {
+        for sub in ["keychain", "policy", "box", "home"] {
             fs::create_dir_all(dir.join(sub)).unwrap();
         }
         Self { dir }
@@ -48,6 +49,7 @@ impl Env {
         cmd.env("HOME", self.dir.join("home"))
             .env("CRED_INDEX", self.dir.join("index.json"))
             .env("CRED_POLICY_DIR", self.dir.join("policy"))
+            .env("CRED_BOX_DIR", self.dir.join("box"))
             .env("CRED_TEST_KEYCHAIN", self.dir.join("keychain"))
             .env("CRED_TEST_APPROVE", "yes")
             .env_remove("CRED_REFRESHING")
@@ -90,6 +92,10 @@ impl Drop for Env {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
     }
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -467,6 +473,195 @@ fn mcp_asks_for_consent_and_for_writes() {
     allowed.handshake();
     let (is_error, reply) = allowed.call("fetch", post);
     assert!(!is_error && reply.contains("HTTP 200"), "{reply}");
+}
+
+// --- cred box (the parts that need no VM) ---
+
+impl Env {
+    /// `cred box ARGS`, with `editor` as $EDITOR.
+    fn boxed(&self, editor: &str, args: &[&str]) -> Output {
+        self.command().arg("box").args(args).env("EDITOR", editor).output().unwrap()
+    }
+
+    fn box_policy_path(&self, name: &str) -> PathBuf {
+        self.dir.join("box").join(format!("{name}.toml"))
+    }
+
+    fn box_key_path(&self, name: &str) -> PathBuf {
+        self.dir.join("keychain").join(format!("box.{name}._key"))
+    }
+
+    /// The store of a box; the test's HOME holds it, so nothing lands in the real Library.
+    fn box_store(&self, name: &str) -> PathBuf {
+        self.dir.join("home/Library/Application Support/cred/box").join(format!("{name}.sparsebundle"))
+    }
+
+    /// An "editor" that replaces the policy with `toml`.
+    fn editor_writing(&self, toml: &str) -> String {
+        let file = self.dir.join("edited-box.toml");
+        fs::write(&file, toml).unwrap();
+        format!("cp {}", file.display())
+    }
+
+    /// Make a box with the default template and approve it.
+    fn new_box(&self, name: &str) {
+        let out = self.boxed("true", &["new", name]);
+        assert!(out.status.success(), "new failed: {}", stderr(&out));
+        let out = self.boxed("true", &["approve", name]);
+        assert!(out.status.success(), "approve failed: {}", stderr(&out));
+    }
+}
+
+#[test]
+fn box_new_makes_a_policy_a_key_and_an_encrypted_store() {
+    let env = Env::new();
+    let out = env.boxed("true", &["new", "research"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("takes effect once approved"), "{}", stdout(&out));
+
+    let policy = fs::read_to_string(env.box_policy_path("research")).unwrap();
+    assert!(policy.contains("cred box approve research"), "{policy}");
+    let key = fs::read_to_string(env.box_key_path("research")).unwrap();
+    assert!(key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()), "256 random bits as hex");
+    let store = env.box_store("research");
+    assert!(store.join("bands").is_dir(), "a sparse bundle");
+
+    let out = env.boxed("true", &["new", "research"]);
+    assert!(!out.status.success() && stderr(&out).contains("exists"), "{}", stderr(&out));
+
+    let ls = stdout(&env.boxed("true", &["ls"]));
+    assert!(ls.contains("research") && ls.contains("locked") && ls.contains("not approved"), "{ls}");
+    let out = env.boxed("true", &["run", "research"]);
+    assert!(!out.status.success() && stderr(&out).contains("isn't approved"), "nothing starts before approval: {}", stderr(&out));
+}
+
+#[test]
+fn box_policies_are_approved_edited_and_blocked_like_resource_policies() {
+    let env = Env::new();
+    env.new_box("research");
+    let ls = stdout(&env.boxed("true", &["ls"]));
+    assert!(ls.contains("research") && ls.contains("approved") && !ls.contains("not approved"), "{ls}");
+
+    // An edit shows a diff against the approved text and blocks the box until approved again.
+    let editor = env.editor_writing(&fs::read_to_string(env.box_policy_path("research")).unwrap().replace("cpus = 4", "cpus = 2"));
+    let out = env.boxed(&editor, &["edit", "research"]);
+    let shown = stdout(&out);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(shown.contains("-cpus = 4\n+cpus = 2\n") && !shown.contains('\x1b'), "{shown}");
+    assert!(stdout(&env.boxed("true", &["ls"])).contains("changed since approval"));
+    let out = env.boxed("true", &["run", "research"]);
+    assert!(!out.status.success() && stderr(&out).contains("changed since it was approved"), "{}", stderr(&out));
+
+    assert!(env.boxed("true", &["approve", "research"]).status.success());
+    assert!(stdout(&env.boxed("true", &["edit", "research"])).contains("no change from the approved policy for box research"));
+}
+
+#[test]
+fn box_policy_approve_with_no_names_covers_boxes_too() {
+    let env = Env::new();
+    env.boxed("true", &["new", "alpha"]);
+    env.boxed("true", &["new", "beta"]);
+    env.policy("app", "[run]\nmode = \"deny\"\n");
+    fs::write(env.box_policy_path("app-box"), "").unwrap();
+
+    let out = env.cred(&["policy", "approve"]);
+    let shown = stdout(&out);
+    assert!(out.status.success(), "{}", stderr(&out));
+    for expected in ["approved the policy for app\n", "approved the policy for box alpha", "approved the policy for box beta", "approved the policy for box app-box"] {
+        assert!(shown.contains(expected), "missing {expected:?}:\n{shown}");
+    }
+    let ls = stdout(&env.boxed("true", &["ls"]));
+    assert!(!ls.contains("not approved"), "{ls}");
+    // Resource names and box names don't collide: the resource list has no boxes in it.
+    assert!(!stdout(&env.cred(&["ls"])).contains("alpha"));
+
+    let out = env.command().args(["policy", "approve"]).env("CRED_TEST_APPROVE", "no").output().unwrap();
+    assert!(!out.status.success());
+}
+
+#[test]
+fn box_new_refuses_policies_the_door_cannot_keep() {
+    let env = Env::new();
+    for (toml, why) in [
+        ("[net]\nwrites = \"allow\"\n", "phase 2"),
+        ("[browser]\nkeep_sessions = true\n", "phase 3"),
+        ("[[mount]]\npath = \"/opt/data\"\nmode = \"rw\"\n", "rw isn't available"),
+        ("nope = 1\n", "unknown field"),
+    ] {
+        let out = env.boxed(&env.editor_writing(toml), &["new", "bad"]);
+        assert!(!out.status.success() && stderr(&out).contains(why), "{toml}: {}", stderr(&out));
+        assert!(!env.box_key_path("bad").exists() && !env.box_store("bad").exists(), "nothing is made for a bad policy");
+        fs::remove_file(env.box_policy_path("bad")).unwrap();
+    }
+}
+
+#[test]
+fn a_box_that_is_not_kept_has_no_key_and_no_store() {
+    let env = Env::new();
+    let out = env.boxed(&env.editor_writing("keep = false\n"), &["new", "scratch"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("keep = false"));
+    assert!(!env.box_key_path("scratch").exists() && !env.box_store("scratch").exists());
+    assert!(stdout(&env.boxed("true", &["ls"])).contains("shredded"));
+}
+
+#[test]
+fn box_import_export_and_log_go_through_touch_id_and_stay_in_the_box() {
+    let env = Env::new();
+    env.new_box("research");
+    let note = env.dir.join("note.txt");
+    fs::write(&note, "hello box\n").unwrap();
+    let out = env.boxed("true", &["import", "research", note.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("work/note.txt"), "{}", stdout(&out));
+    assert!(!env.dir.join("home/Library/Application Support/cred/box/open/research").exists(), "the store is closed again");
+    assert!(!fs::read_dir(env.box_store("research").join("bands")).unwrap().any(|b| fs::read(b.unwrap().path()).unwrap().windows(9).any(|w| w == b"hello box")), "ciphertext at rest");
+
+    let out_dir = env.dir.join("out");
+    fs::create_dir(&out_dir).unwrap();
+    let export = |env: &Env, args: &[&str]| env.boxed("true", &[&["export", "research"], args].concat());
+    let out = export(&env, &["work/note.txt", "--to", out_dir.to_str().unwrap()]);
+    let shown = stdout(&out);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(shown.contains("10 B") && shown.contains("work/note.txt") && shown.contains(&sha256(b"hello box\n")), "{shown}");
+    assert_eq!(fs::read_to_string(out_dir.join("note.txt")).unwrap(), "hello box\n");
+
+    // What leaves is logged in the box.
+    let log = stdout(&env.boxed("true", &["log", "research"]));
+    assert!(log.contains("\"kind\":\"export\"") && log.contains("work/note.txt") && log.contains("\"kind\":\"import\""), "{log}");
+
+    // Paths that lead out of the box, and a refused Touch ID, export nothing.
+    for bad in ["../note.txt", "/etc/passwd", "work/missing"] {
+        let out = export(&env, &[bad, "--to", out_dir.to_str().unwrap()]);
+        assert!(!out.status.success(), "exported {bad}");
+    }
+    fs::remove_file(out_dir.join("note.txt")).unwrap();
+    let out = env.command().args(["box", "export", "research", "work/note.txt", "--to"]).arg(&out_dir).env("CRED_TEST_APPROVE", "no").output().unwrap();
+    assert!(!out.status.success() && !out_dir.join("note.txt").exists());
+}
+
+#[test]
+fn box_rm_deletes_the_key_then_the_store_and_warns_about_backups() {
+    let env = Env::new();
+    env.new_box("research");
+    let store = env.box_store("research");
+    assert!(store.exists() && env.box_key_path("research").exists());
+
+    let out = env.command().args(["box", "rm", "research"]).env("CRED_TEST_APPROVE", "no").output().unwrap();
+    assert!(!out.status.success());
+    assert!(store.exists() && env.box_key_path("research").exists(), "nothing is deleted without Touch ID");
+
+    let out = env.boxed("true", &["rm", "research"]);
+    let shown = stdout(&out);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(shown.contains("Time Machine") && shown.contains("old key"), "{shown}");
+    assert!(!store.exists() && !env.box_key_path("research").exists());
+    assert!(!env.dir.join("keychain/box.research._policy").exists(), "the approval goes too");
+    assert!(env.box_policy_path("research").exists(), "the policy file stays");
+    assert!(stdout(&env.boxed("true", &["ls"])).contains("no store"));
+    let out = env.boxed("true", &["run", "research"]);
+    assert!(!out.status.success() && stderr(&out).contains("isn't approved"));
+    assert!(!env.boxed("true", &["rm", "nothing"]).status.success());
 }
 
 // --- opt-in: the browser and the real Touch ID ---
