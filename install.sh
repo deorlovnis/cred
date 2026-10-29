@@ -46,7 +46,7 @@ fi
 
 # Keychain items are tied to the build that wrote them, so a new cred can't read the old
 # approvals silently: approve the policies again, with one Touch ID for all of them.
-if [ -n "$(ls "$HOME/.config/cred/policy/"*.toml 2>/dev/null)" ]; then
+if [ -n "$(ls "$HOME/.config/cred/policy/"*.toml "$HOME/.config/cred/box/"*.toml 2>/dev/null)" ]; then
   echo "Approve your policies again (Touch ID):"
   "$dest" policy approve || echo "skipped: run 'cred policy approve' to re-enable your sites" >&2
 fi

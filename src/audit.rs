@@ -411,11 +411,11 @@ mod tests {
     fn lines_hold_no_values() {
         let dir = TempDir::new("cred-audit").unwrap();
         let masker = Masker::new(["s3cret-value".to_string()]);
-        let url = "https://u:p@api.example.com/x?a=1&token=abc&q=s3cret-value#frag";
+        let url = "https://u:p@api.example.com/x?a=1&token=zqx-token&q=s3cret-value#frag";
         let body = Body::new("app", "fetch\u{1b}[2J", Some("post"), Some(url), Decision::AskedNo, &masker);
         log(&dir).append(body).unwrap();
         let text = fs::read_to_string(dir.0.join("audit.log")).unwrap();
-        for leaked in ["s3cret-value", "abc", "frag", "u:p", "\\u001b"] {
+        for leaked in ["s3cret-value", "zqx-token", "frag", "u:p", "\\u001b"] {
             assert!(!text.contains(leaked), "{leaked} in {text}");
         }
         assert!(text.contains("\"decision\":\"asked:no\"") && text.contains("a=1&token=********&q=********"));
