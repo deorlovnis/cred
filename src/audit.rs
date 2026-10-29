@@ -10,8 +10,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
+#[cfg(debug_assertions)]
 use std::env;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use jiff::Timestamp;
