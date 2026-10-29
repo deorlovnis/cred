@@ -33,7 +33,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_PATH: usize = 200;
 
 /// Headers that belong to one connection, not to the request.
-const HOP_BY_HOP: [&str; 9] =
+pub(super) const HOP_BY_HOP: [&str; 9] =
     ["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade"];
 /// Other headers that aren't passed on: the box's own address and framing (rebuilt for the
 /// upstream call), its credentials, and content encodings (the upstream is asked for none).

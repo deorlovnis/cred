@@ -9,7 +9,7 @@
 //! CA it copies bytes both ways and sees no requests.
 
 use std::io::{self, BufReader, Read, Write};
-use std::net::{IpAddr, Shutdown, TcpStream};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::thread;
 use std::time::Duration;
@@ -22,6 +22,8 @@ use super::{Entry, Shared};
 
 /// The guest has this long to send its CONNECT line once it has taken a connection.
 const HEAD_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a reconnect to a site that closed an idle connection may take.
+const RECONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
 pub fn serve(sh: &Shared, mut reader: BufReader<UnixStream>, mut writer: UnixStream) {
     let _ = writer.set_read_timeout(Some(HEAD_TIMEOUT));
@@ -62,7 +64,17 @@ pub fn serve(sh: &Shared, mut reader: BufReader<UnixStream>, mut writer: UnixStr
     match guest {
         Ok(guest) => {
             sh.log.write(&entry("allowed", 0, 0));
-            let (up, down) = inspect::serve(guest.clone(), site.clone(), &Ctx { shared: sh, host: &host });
+            // The first request uses the connection made above; a reconnect dials the same vetted
+            // address again (never a fresh lookup) and verifies the site again.
+            let mut first = Some(site.clone());
+            let connect = || -> anyhow::Result<tls::Tls> {
+                if let Some(site) = first.take() {
+                    return Ok(site);
+                }
+                let tcp = TcpStream::connect_timeout(&SocketAddr::new(ip, HTTPS_PORT), RECONNECT_TIMEOUT)?;
+                tls::connect(sh.net.tls(), &host, tcp)
+            };
+            let (up, down) = inspect::serve(guest.clone(), connect, &Ctx { shared: sh, host: &host });
             let _ = guest.finish();
             let _ = site.finish();
             sh.log.write(&entry("closed", up, down));

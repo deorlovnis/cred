@@ -18,8 +18,10 @@ use serde_json::Value;
 
 use super::addr::Net;
 use super::http;
+use super::inspect;
 use super::tls::{BoxCa, client_config_trusting, trust_only};
 use super::{Config, Door};
+use crate::policy::Mode;
 use crate::util::TempDir;
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -122,7 +124,7 @@ fn client(trusting: &BoxCa, alpn: &[&[u8]], host: &str, io: Duplex) -> Guest {
 
 /// One request and its whole answer, on a connection that stays open.
 fn request(tls: &mut Guest, line: &str, body: &str) -> (String, Vec<u8>) {
-    write!(tls, "{line}\r\nHost: site\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+    write!(tls, "{line}\r\nHost: good.example.com\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
     tls.flush().unwrap();
     let mut reader = BufReader::new(&mut *tls);
     let head = http::read_head(&mut reader).unwrap().expect("an answer");
@@ -176,7 +178,7 @@ fn the_door_ends_tls_for_a_guest_that_trusts_only_the_box_ca() {
     shim.0.set_nonblocking(true).unwrap();
     let log = dir.0.join("log").join("door.log");
     let door = Door::start_with(
-        Config { name: "testbox".into(), socket, allow: vec!["*".into()], model: None, sites: vec![], log: log.clone(), ca: Some(box_ca.clone()) },
+        Config { name: "testbox".into(), socket, allow: vec!["*".into()], model: None, sites: vec![], net: inspect::Net { writes: Mode::Allow, allow_writes: vec![] }, log_key: [9; 32], log: log.clone(), ca: Some(box_ca.clone()) },
         net,
     )
     .unwrap();
@@ -201,7 +203,8 @@ fn the_door_ends_tls_for_a_guest_that_trusts_only_the_box_ca() {
     drop(tls);
     let closed = wait_for(|| log_lines(&log).into_iter().find(|l| l["kind"] == "proxy" && l["decision"] == "closed"));
     assert_eq!(closed["host"], "good.example.com");
-    assert!(closed["up"].as_u64().unwrap() > 100 && closed["down"].as_u64().unwrap() > 1 << 20, "{closed}");
+    // Counted as body bytes: "ping" up; "hello", "ping" and the megabyte down.
+    assert!(closed["up"].as_u64() == Some(4) && closed["down"].as_u64().unwrap() > 1 << 20, "{closed}");
 
     // A site whose certificate is for another name, or from a CA nobody trusts, gets the
     // guest a 502 and no tunnel: the door's own check is as strict as any client's.
@@ -230,8 +233,10 @@ fn the_door_ends_tls_for_a_guest_that_trusts_only_the_box_ca() {
     assert!(failures.iter().any(|d| d.contains("not valid for name")), "{failures:?}");
     assert!(failures.iter().any(|d| d.contains("UnknownIssuer")), "{failures:?}");
     assert!(lines.iter().any(|l| l["host"] == "good.example.com" && l["decision"] == "allowed"));
+    // Requests are logged by method and masked URL; bodies never.
+    assert!(lines.iter().any(|l| l["kind"] == "request" && l["url"] == "https://good.example.com/hello"));
     let text = std::fs::read_to_string(&log).unwrap();
-    assert!(!text.contains("/hello") && !text.contains("ping"), "{text}");
+    assert!(!text.contains("ping"), "{text}");
     door.stop();
 }
 
@@ -284,7 +289,7 @@ fn real_vm_tools_trust_the_door_and_only_the_door() {
     };
     let ca = Arc::new(BoxCa::generate("e2e").unwrap());
     let log = dir.join("log").join("door.log");
-    let config = Config { name: name.clone(), socket: spec.socket.clone(), allow: vec!["*".into()], model: None, sites: vec![], log: log.clone(), ca: Some(ca.clone()) };
+    let config = Config { name: name.clone(), socket: spec.socket.clone(), allow: vec!["*".into()], model: None, sites: vec![], net: Default::default(), log_key: [9; 32], log: log.clone(), ca: Some(ca.clone()) };
     let door = Door::start(config).unwrap();
     let vm = Vm(name.clone());
     engine::run(&spec).unwrap();

@@ -144,6 +144,179 @@ fn read_chunked(r: &mut impl BufRead, max: usize) -> io::Result<Vec<u8>> {
     }
 }
 
+/// How a message's body is delimited.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum Framing {
+    /// There is no body.
+    None,
+    Length(u64),
+    Chunked,
+    /// The body is everything until the connection closes (responses only).
+    UntilClose,
+}
+
+fn declared_length(head: &Head) -> io::Result<Option<u64>> {
+    let lengths: Vec<&str> = head.headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case("content-length")).map(|(_, v)| v.as_str()).collect();
+    match lengths.as_slice() {
+        [] => Ok(None),
+        [first, rest @ ..] => {
+            if rest.iter().any(|l| l != first) || first.is_empty() || !first.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(invalid("bad Content-Length"));
+            }
+            first.parse().map(Some).map_err(|_| invalid("bad Content-Length"))
+        }
+    }
+}
+
+fn framing_of(head: &Head, none: Framing) -> io::Result<Framing> {
+    match (head.header("transfer-encoding"), declared_length(head)?) {
+        (Some(_), Some(_)) => Err(invalid("both Content-Length and Transfer-Encoding")),
+        (Some(te), None) if te.eq_ignore_ascii_case("chunked") => Ok(Framing::Chunked),
+        (Some(_), None) => Err(invalid("unsupported Transfer-Encoding")),
+        (None, Some(len)) => Ok(Framing::Length(len)),
+        (None, None) => Ok(none),
+    }
+}
+
+/// How the body of a request is delimited.
+pub fn request_framing(head: &Head) -> io::Result<Framing> {
+    framing_of(head, Framing::None)
+}
+
+/// How the body of a response to `method` is delimited. `head` is the response's.
+pub fn response_framing(head: &Head, method: &str, status: u16) -> io::Result<Framing> {
+    if method == "HEAD" || matches!(status, 100..=199 | 204 | 304) {
+        return Ok(Framing::None);
+    }
+    framing_of(head, Framing::UntilClose)
+}
+
+impl Head {
+    /// The status of a response's status line (`HTTP/1.1 404 Not Found`).
+    pub fn status(&self) -> Option<u16> {
+        let mut parts = self.line.splitn(3, ' ');
+        match (parts.next(), parts.next()) {
+            (Some(version), Some(status)) if version.starts_with("HTTP/") => status.parse().ok().filter(|s| (100..1000).contains(s)),
+            _ => None,
+        }
+    }
+}
+
+/// A message body as bytes, with the framing taken off: what `read` returns is the content. It
+/// returns what is there as soon as some is, so a stream of events arrives event by event. The
+/// framing is checked as it goes (`InvalidData`), and a body cut short is `UnexpectedEof`.
+pub struct Body<'a, R> {
+    r: &'a mut R,
+    state: State,
+}
+
+enum State {
+    /// This many bytes of the body are still to come.
+    Length(u64),
+    /// The next thing is a chunk-size line.
+    ChunkHead,
+    /// This many bytes of the current chunk are still to come, then its line break.
+    Chunk(u64),
+    UntilClose,
+    Done,
+}
+
+impl<'a, R: BufRead> Body<'a, R> {
+    pub fn new(r: &'a mut R, framing: Framing) -> Self {
+        let state = match framing {
+            Framing::None | Framing::Length(0) => State::Done,
+            Framing::Length(n) => State::Length(n),
+            Framing::Chunked => State::ChunkHead,
+            Framing::UntilClose => State::UntilClose,
+        };
+        Self { r, state }
+    }
+
+    /// Read and drop what is left, as far as `limit` bytes; false if the body is longer.
+    pub fn discard(&mut self, limit: u64) -> io::Result<bool> {
+        let (mut buf, mut total) = ([0u8; 8192], 0u64);
+        loop {
+            let n = self.read(&mut buf)?;
+            if n == 0 {
+                return Ok(true);
+            }
+            total += n as u64;
+            if total > limit {
+                return Ok(false);
+            }
+        }
+    }
+}
+
+impl<R: BufRead> Read for Body<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            match self.state {
+                State::Done => return Ok(0),
+                _ if buf.is_empty() => return Ok(0),
+                State::UntilClose => return self.r.read(buf),
+                State::Length(left) => {
+                    let room = left.min(buf.len() as u64) as usize;
+                    let n = self.r.read(&mut buf[..room])?;
+                    if n == 0 {
+                        return Err(io::ErrorKind::UnexpectedEof.into());
+                    }
+                    self.state = if left == n as u64 { State::Done } else { State::Length(left - n as u64) };
+                    return Ok(n);
+                }
+                State::ChunkHead => {
+                    let line = read_line(self.r, 1024)?.ok_or(io::ErrorKind::UnexpectedEof)?;
+                    let size = line.split(';').next().unwrap_or("").trim();
+                    let size = u64::from_str_radix(size, 16).map_err(|_| invalid("bad chunk size"))?;
+                    if size == 0 {
+                        // Trailers, up to the blank line, are dropped.
+                        while !read_line(self.r, 8192)?.ok_or(io::ErrorKind::UnexpectedEof)?.is_empty() {}
+                        self.state = State::Done;
+                    } else {
+                        self.state = State::Chunk(size);
+                    }
+                }
+                State::Chunk(left) => {
+                    let room = left.min(buf.len() as u64) as usize;
+                    let n = self.r.read(&mut buf[..room])?;
+                    if n == 0 {
+                        return Err(io::ErrorKind::UnexpectedEof.into());
+                    }
+                    if left == n as u64 {
+                        if !read_line(self.r, 2)?.ok_or(io::ErrorKind::UnexpectedEof)?.is_empty() {
+                            return Err(invalid("chunk not followed by a line break"));
+                        }
+                        self.state = State::ChunkHead;
+                    } else {
+                        self.state = State::Chunk(left - n as u64);
+                    }
+                    return Ok(n);
+                }
+            }
+        }
+    }
+}
+
+/// Write one chunk of a chunked body (nothing for an empty piece, which would end it).
+pub fn write_chunk(w: &mut impl Write, data: &[u8]) -> io::Result<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    write!(w, "{:x}\r\n", data.len())?;
+    w.write_all(data)?;
+    w.write_all(b"\r\n")
+}
+
+/// Write a request or status line and headers, and the blank line after them.
+pub fn write_head(w: &mut impl Write, line: &str, headers: &[(String, String)]) -> io::Result<()> {
+    let mut head = format!("{line}\r\n");
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
+    w.write_all(head.as_bytes())
+}
+
 /// Write a complete response with a body of known length.
 pub fn respond(w: &mut impl Write, status: u16, content_type: &str, body: &[u8], keep_alive: bool) -> io::Result<()> {
     let reason = reason(status);

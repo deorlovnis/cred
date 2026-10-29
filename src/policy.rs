@@ -448,6 +448,13 @@ impl Policy {
 }
 
 impl Fetch {
+    /// Whether the policy lists this host (lower case, as the door knows it) among its https hosts.
+    pub fn covers_host(&self, host: &str) -> bool {
+        let authority = if host.contains(':') { format!("[{host}]") } else { host.to_string() };
+        let origin = format!("https://{authority}");
+        self.hosts.iter().filter_map(|h| host_origin(h).ok()).any(|h| h == origin)
+    }
+
     /// The URL, if it is on one of the policy's hosts.
     pub fn check_url(&self, raw: &str) -> Result<Url> {
         let url = Url::parse(raw).map_err(|e| anyhow!("'{raw}' isn't a URL: {e}"))?;

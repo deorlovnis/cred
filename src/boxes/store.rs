@@ -21,6 +21,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use jiff::Timestamp;
 use serde_json::json;
 
+use crate::chain::Chain;
 use crate::util::home;
 
 /// The most a store can hold; the bundle grows as needed and starts small.
@@ -333,13 +334,13 @@ pub fn usage(bundle: &Path) -> (u64, Option<SystemTime>) {
     (bytes, newest)
 }
 
-/// Append a line to the store's log, in the door's shape: time, kind, path, bytes, decision.
-pub fn log_event(mnt: &Path, kind: &str, path: &str, bytes: u64, decision: &str) -> Result<()> {
+/// Append a line to the store's log, in the door's shape: time, kind, path, bytes, decision. The
+/// door's lines chain with the same key, so this one is part of the chain too.
+pub fn log_event(mnt: &Path, log_key: &[u8; 32], kind: &str, path: &str, bytes: u64, decision: &str) -> Result<()> {
     let line = json!({ "time": Timestamp::now().to_string(), "kind": kind, "path": path, "bytes": bytes, "decision": decision });
-    let log = mnt.join(DOOR_LOG);
-    let mut file = OpenOptions::new().create(true).append(true).mode(0o600).open(&log).with_context(|| format!("opening {}", log.display()))?;
-    writeln!(file, "{line}")?;
-    Ok(())
+    let chain = Chain::new(&door_log(mnt), *log_key);
+    chain.create()?;
+    chain.append(line)
 }
 
 pub fn door_log(mnt: &Path) -> PathBuf {
@@ -496,7 +497,7 @@ mod tests {
         let marker = "MARKER-0123456789-abcdefghijklmnopqrstuvwxyz";
         fs::write(mnt.join("work/note.txt"), marker.repeat(100)).unwrap();
         assert_eq!(fs::metadata(mnt.join("work/note.txt")).unwrap().uid(), fs::metadata(&dir.0).unwrap().uid(), "owners are kept");
-        log_event(store.path(), "export", "work/note.txt", 4300, "allowed").unwrap();
+        log_event(store.path(), &[7; 32], "export", "work/note.txt", 4300, "allowed").unwrap();
         assert!(fs::read_to_string(door_log(&mnt)).unwrap().contains("\"kind\":\"export\""));
         drop(store);
         assert!(!is_mounted(&mnt) && !mnt.exists());

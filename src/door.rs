@@ -11,20 +11,20 @@
 //! - `mcp`: cred's MCP server for the box, limited to its sites.
 //!
 //! Every decision is logged as a JSON line: time, kind, host or path, bytes, decision. Never
-//! values or headers.
+//! values or headers. Each line is chained to the one before with an HMAC (see `chain`), so an
+//! edited or removed line shows; requests inside a connection the door has opened up are judged
+//! and logged one by one (see `inspect`).
 
 mod addr;
 mod gateway;
 mod http;
-mod inspect;
+pub mod inspect;
 mod proxy;
 mod tls;
 
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -33,10 +33,11 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use jiff::Timestamp;
 use serde::Serialize;
 
+use crate::chain::Chain;
 use crate::mcp::{self, Scope};
 use crate::policy;
 use addr::{Allow, Net};
@@ -66,11 +67,15 @@ pub struct Config {
     pub model: Option<String>,
     /// The resources served over `mcp`; their own approved policies apply.
     pub sites: Vec<String>,
-    /// Where decisions are logged (JSON lines).
+    /// `[net] writes` and `allow_writes`: what the box's own requests may do (see `inspect`).
+    pub net: inspect::Net,
+    /// Where decisions are logged (JSON lines, each chained to the one before with an HMAC).
     pub log: PathBuf,
     /// The box's CA. With it the door ends TLS and reads the requests inside (see `tls`);
     /// without it, it tunnels bytes it can't read.
     pub ca: Option<Arc<BoxCa>>,
+    /// The key of that chain, derived from the box key.
+    pub log_key: [u8; 32],
 }
 
 /// A running door. Dropping it stops it.
@@ -85,17 +90,7 @@ impl Door {
     }
 
     fn start_with(cfg: Config, net: Net) -> Result<Door> {
-        let shared = Arc::new(Shared {
-            allow: Allow::parse(&cfg.allow)?,
-            log: Log::open(&cfg.log)?,
-            agent: gateway::agent(),
-            net,
-            cfg,
-            stopped: AtomicBool::new(false),
-            active: AtomicUsize::new(0),
-            next_id: AtomicU64::new(0),
-            conns: Mutex::new(HashMap::new()),
-        });
+        let shared = Arc::new(Shared::new(cfg, net)?);
         let sh = shared.clone();
         let dialer = thread::Builder::new().name("door-dialer".into()).spawn(move || dial_loop(&sh))?;
         Ok(Door { shared, dialer: Some(dialer) })
@@ -142,6 +137,20 @@ struct Shared {
 }
 
 impl Shared {
+    fn new(cfg: Config, net: Net) -> Result<Self> {
+        Ok(Self {
+            allow: Allow::parse(&cfg.allow)?,
+            log: Log::open(&cfg.log, cfg.log_key)?,
+            agent: gateway::agent(),
+            net,
+            cfg,
+            stopped: AtomicBool::new(false),
+            active: AtomicUsize::new(0),
+            next_id: AtomicU64::new(0),
+            conns: Mutex::new(HashMap::new()),
+        })
+    }
+
     fn stopped(&self) -> bool {
         self.stopped.load(Ordering::SeqCst)
     }
@@ -292,7 +301,7 @@ impl<T: Write> Write for Counting<T> {
 /// One line of the door's log.
 #[derive(Serialize)]
 struct Entry {
-    /// `proxy`, `model` (the gateway), `mcp`, or `unknown`.
+    /// `proxy` (a connection), `request` (one request inside it), `model` (the gateway), `mcp`, or `unknown`.
     kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     host: Option<String>,
@@ -304,18 +313,21 @@ struct Entry {
     path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     method: Option<String>,
+    /// The URL of a request, masked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<u16>,
     /// Bytes from the guest, and to it.
     up: u64,
     down: u64,
-    /// `allowed`, `closed`, `blocked:<why>` or `failed:<why>`.
+    /// `allowed`, `asked:yes`, `asked:no`, `closed`, `blocked:<why>` or `failed:<why>`.
     decision: String,
 }
 
 impl Entry {
     fn new(kind: &'static str, decision: &str) -> Self {
-        Self { kind, host: None, addr: None, path: None, method: None, status: None, up: 0, down: 0, decision: decision.to_string() }
+        Self { kind, host: None, addr: None, path: None, method: None, url: None, status: None, up: 0, down: 0, decision: decision.to_string() }
     }
 }
 
@@ -326,27 +338,27 @@ struct Line<'a> {
     entry: &'a Entry,
 }
 
-struct Log(Mutex<File>);
+/// The door's log: every line chained to the one before (see `chain`), so an edit shows.
+struct Log(Chain);
 
 impl Log {
-    fn open(path: &Path) -> Result<Self> {
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        }
-        let file = OpenOptions::new().append(true).create(true).mode(0o600).open(path).with_context(|| format!("opening {}", path.display()))?;
-        Ok(Self(Mutex::new(file)))
+    fn open(path: &Path, key: [u8; 32]) -> Result<Self> {
+        let chain = Chain::new(path, key);
+        chain.create()?;
+        Ok(Self(chain))
     }
 
     /// Append the entry. A log that can't be written doesn't stop the door.
     fn write(&self, entry: &Entry) {
         let time = Timestamp::from_millisecond(Timestamp::now().as_millisecond()).map(|t| t.to_string()).unwrap_or_default();
-        let Ok(line) = serde_json::to_string(&Line { time, entry }) else { return };
-        let mut file = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = writeln!(file, "{line}");
+        let Ok(line) = serde_json::to_value(Line { time, entry }) else { return };
+        let _ = self.0.append(line);
     }
 }
 
 #[cfg(test)]
 mod intercept_tests;
+#[cfg(test)]
+mod inspect_tests;
 #[cfg(test)]
 mod tests;

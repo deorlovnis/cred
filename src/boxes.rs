@@ -7,9 +7,10 @@
 //! `cred:box.<name>/_key`, read only to open the store. `run` (see `run`) opens the store, starts
 //! the VM and the door, and tears it all down again.
 //!
-//! Phase 1 scope: the door sees host names, not requests, so `[net] allow` is all it enforces.
-//! The policy still has the fields of later phases; values that promise something the door
-//! can't keep yet are refused, not ignored.
+//! The door sees every request (see `door::inspect`): `[net] allow` says which hosts the box may
+//! reach, `writes` and `allow_writes` what it may send them besides reads, and `standins` which
+//! environment variables hold the stand-in for a site's credential. Fields of a later phase
+//! (`[browser]`) are refused, not ignored.
 
 mod run;
 mod store;
@@ -26,9 +27,11 @@ use jiff::tz::TimeZone;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::chain::Chain;
+use crate::door::inspect::parse_prefix;
 use crate::policy::{self, Approval, Mode, Site, Status};
 use crate::util::{config_dir, expand_home, home};
-use crate::{approve, engine, keychain, parse_resource};
+use crate::{approve, engine, keychain, parse_env, parse_resource};
 use store::Layout;
 
 /// Keychain names of box items start with this. Resource names can't contain a dot.
@@ -87,6 +90,10 @@ pub struct BoxPolicy {
     /// Resources the agent may use through cred; their own policies apply.
     #[serde(default)]
     pub sites: Vec<String>,
+    /// Environment variables set to the stand-in `cred-managed` for tools that refuse to start
+    /// without a token (`GH_TOKEN`). The door adds the real credential on the hosts of `sites`.
+    #[serde(default)]
+    pub standins: Vec<String>,
     /// false: the box is shredded when it stops.
     #[serde(default = "default_keep")]
     pub keep: bool,
@@ -112,10 +119,10 @@ pub struct Net {
     /// "*" (any public https site) or patterns like "https://*.wikipedia.org". Empty: nowhere.
     #[serde(default)]
     pub allow: Vec<String>,
-    /// Phase 2. Only "deny" is accepted now.
+    /// Requests other than reads (see `door::inspect`) to hosts no site covers: deny | ask | allow.
     #[serde(default)]
     pub writes: Mode,
-    /// Phase 2. Must be empty now.
+    /// URL prefixes (`https://host/path`) that may receive writes whatever `writes` says.
     #[serde(default)]
     pub allow_writes: Vec<String>,
 }
@@ -212,6 +219,16 @@ impl BoxPolicy {
                 bail!("sites lists {site} twice");
             }
         }
+        let reserved: BTreeSet<String> = [true, false].into_iter().flat_map(engine::agent_env).map(|(name, _)| name).collect();
+        for name in &self.standins {
+            parse_env(name).map_err(|e| anyhow!("standins: '{name}': {e}"))?;
+            if reserved.contains(name) {
+                bail!("standins: {name} is set by cred already");
+            }
+            if self.standins.iter().filter(|n| *n == name).count() > 1 {
+                bail!("standins lists {name} twice");
+            }
+        }
         if self.docker {
             bail!("docker = true isn't available yet: the agent image has no Docker Engine");
         }
@@ -231,8 +248,8 @@ impl BoxPolicy {
                 bail!("[net] allow '{entry}': https sites on the default port only");
             }
         }
-        if self.net.writes != Mode::Deny || !self.net.allow_writes.is_empty() {
-            bail!("[net] writes and allow_writes arrive with phase 2 (the door can't tell reads from writes yet): leave them out");
+        for entry in &self.net.allow_writes {
+            parse_prefix(entry).map_err(|e| anyhow!("[net] allow_writes '{entry}': {e}"))?;
         }
         if self.browser.is_some() {
             bail!("[browser] arrives with phase 3 (the browser in the box): leave it out");
@@ -275,14 +292,15 @@ run = ["claude"]                        # what `cred box run {name}` starts
 {image}
 model = "anthropic"                     # resource whose key cred adds to the agent's model calls
 sites = []                              # resources the agent may use through cred; their policies apply
-keep = true                             # false: the box is shredded when it stops
+# standins = ["GH_TOKEN"]               # variables set to "cred-managed" for tools that insist on a token; cred adds the real credential on the hosts of `sites`
+keep = true                            # false: the box is shredded when it stops
 cpus = 4
 memory = "8G"
 
 [net]                                   # where the agent's own requests may go; nothing else is reachable
-allow = []                              # ["*"] = any public https site, or a list like ["https://*.wikipedia.org"]
-                                        # Phase 1: the door sees host names, not requests, so an allowed
-                                        # site gets whatever the agent sends it. List sites you trust.
+allow = ["*"]                           # any public https site, reads only (see writes); or a list like ["https://*.wikipedia.org"], or [] for nowhere
+writes = "deny"                         # anything but a read (GET, HEAD, OPTIONS, a fetch or clone) to a host no `sites` entry covers: deny | ask (Touch ID each) | allow
+# allow_writes = ["https://api.example.com/search"]   # URL prefixes that may receive writes anyway
 
 # [[mount]]                             # holes in the box: none unless listed
 # path = "~/Git/project"
@@ -329,6 +347,28 @@ pub fn approve(names_given: &[String]) -> Result<()> {
 }
 
 // --- commands ---
+
+/// The box's store key, from the Keychain.
+fn box_key(name: &str) -> Result<String> {
+    keychain::get(&key(name), KEY_FIELD)
+        .ok_or_else(|| anyhow!("the key of box {name} isn't in the Keychain, so its store can't be opened (cred box rm {name})"))
+}
+
+// STUB: replaced at merge by seal::derive (one key per purpose, derived from the box key)
+fn derive(box_key: &[u8], purpose: &str) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"cred box key derivation stub\0");
+    hash.update(purpose.as_bytes());
+    hash.update(b"\0");
+    hash.update(box_key);
+    hash.finalize().into()
+}
+
+/// The key that chains the box's log (`door.log`), derived from the box key; `key` is the box
+/// key as the Keychain holds it.
+fn log_key(key: &str) -> [u8; 32] {
+    derive(key.as_bytes(), "log")
+}
 
 fn has_key(name: &str) -> bool {
     keychain::exists(&key(name), KEY_FIELD)
@@ -456,15 +496,22 @@ fn with_store<T>(name: &str, reason: &str, readonly: bool, f: impl FnOnce(&Path)
         return f(&mnt);
     };
     approve::confirm(reason)?;
-    let key = keychain::get(&key(name), KEY_FIELD)
-        .ok_or_else(|| anyhow!("the key of box {name} isn't in the Keychain, so its store can't be opened (cred box rm {name})"))?;
+    let key = box_key(name)?;
     let open = store::open(&bundle, &mnt, &key, readonly)?;
     f(open.path())
 }
 
-/// What the door and cred did for a box, latest last.
-pub fn log(name: &str, last: usize) -> Result<()> {
+/// What the door and cred did for a box, latest last. With `verify`, checks the whole log
+/// against its chain instead, and fails naming the first line that was changed or removed.
+pub fn log(name: &str, last: usize, verify: bool) -> Result<()> {
     with_store(name, &format!("read the log of box {name}"), true, |mnt| {
+        if verify {
+            let chain = Chain::new(&store::door_log(mnt), log_key(&box_key(name)?));
+            let found = chain.verify().with_context(|| format!("the log of box {name}"))?;
+            let before = if found.unchained > 0 { format!(" ({} older lines from before the log was chained can't be checked)", found.unchained) } else { String::new() };
+            println!("{} lines, chain intact{before}", found.chained);
+            return Ok(());
+        }
         let text = fs::read_to_string(store::door_log(mnt)).unwrap_or_default();
         let lines: Vec<&str> = text.lines().collect();
         for line in &lines[lines.len().saturating_sub(last)..] {
@@ -535,11 +582,12 @@ pub fn export(name: &str, rel: &str, to: &Path) -> Result<()> {
     box_path(rel)?;
     let reason = format!("export {rel} from box {name} to {}", to.display());
     with_store(name, &reason, false, |mnt| {
+        let log_key = log_key(&box_key(name)?);
         let (files, skipped) = export_from(mnt, rel, to)?;
         let mut total = 0;
         for f in &files {
             println!("{:>10}  {}  {}", human(f.size), f.sha256, f.file.display());
-            store::log_event(mnt, "export", &f.file.display().to_string(), f.size, "allowed")?;
+            store::log_event(mnt, &log_key, "export", &f.file.display().to_string(), f.size, "allowed")?;
             total += f.size;
         }
         let links = if skipped > 0 { format!(" ({skipped} links and special files skipped)") } else { String::new() };
@@ -552,10 +600,11 @@ pub fn import(name: &str, from: &str) -> Result<()> {
     let src = expand_home(from);
     let file_name = src.file_name().map(|n| n.to_os_string()).ok_or_else(|| anyhow!("{from} isn't a file or folder"))?;
     with_store(name, &format!("import {} into box {name}", src.display()), false, |mnt| {
+        let log_key = log_key(&box_key(name)?);
         let dst = mnt.join("work").join(&file_name);
         let copied = store::copy_tree(&src, &dst)?;
         let rel = Path::new("work").join(&file_name);
-        store::log_event(mnt, "import", &rel.display().to_string(), 0, "allowed")?;
+        store::log_event(mnt, &log_key, "import", &rel.display().to_string(), 0, "allowed")?;
         println!("imported {} file(s) into {}", copied.files.len(), rel.display());
         Ok(())
     })
@@ -669,9 +718,12 @@ mod tests {
             cpus = 2
             memory = "512M"
 
+            standins = ["GH_TOKEN", "NPM_TOKEN"]
+
             [net]
             allow = ["*", "https://*.wikipedia.org", "https://docs.rs", "https://Example.com"]
-            writes = "deny"
+            writes = "ask"
+            allow_writes = ["https://api.example.com/search", "https://docs.rs"]
 
             [[mount]]
             path = "~/Git/cred"
@@ -684,6 +736,8 @@ mod tests {
         .unwrap();
         assert_eq!((p.keep, p.cpus, p.memory.as_str(), p.docker), (false, 2, "512M", false));
         assert_eq!(p.allow(), ["*", "https://*.wikipedia.org", "https://docs.rs", "https://example.com"]);
+        assert_eq!((p.net.writes, p.net.allow_writes.len(), p.standins.as_slice()), (Mode::Ask, 2, &["GH_TOKEN".to_string(), "NPM_TOKEN".to_string()][..]));
+        assert_eq!(BoxPolicy::parse("[net]\nwrites = \"allow\"").unwrap().net.writes, Mode::Allow);
         assert_eq!((p.mounts[0].name(), p.mounts[0].readonly()), ("cred".to_string(), false));
         assert_eq!((p.mounts[1].name(), p.mounts[1].readonly()), ("data".to_string(), true));
     }
@@ -691,6 +745,7 @@ mod tests {
     #[test]
     fn an_empty_policy_is_a_closed_box() {
         let p = BoxPolicy::parse("").unwrap();
+        assert!(p.net.writes == Mode::Deny && p.net.allow_writes.is_empty() && p.standins.is_empty());
         assert_eq!((p.run.as_slice(), p.keep, p.cpus, p.memory.as_str()), (&["claude".to_string()][..], true, 4, "8G"));
         assert!(p.allow().is_empty() && p.sites.is_empty() && p.mounts.is_empty() && p.image.is_none());
     }
@@ -698,10 +753,7 @@ mod tests {
     #[test]
     fn rejects_what_the_door_cannot_keep() {
         for (text, why) in [
-            ("[net]\nwrites = \"allow\"", "phase 2"),
-            ("[net]\nwrites = \"ask\"", "phase 2"),
             ("docker = true", "docker = true isn't available"),
-            ("[net]\nallow_writes = [\"https://a.example.com\"]", "phase 2"),
             ("[browser]\nkeep_sessions = true", "phase 3"),
             ("[[mount]]\npath = \"/opt/data\"\nmode = \"rw\"", "rw isn't available"),
             ("[[mount]]\npath = \"/opt/data\"\nmode = \"x\"", "isn't clone or ro"),
@@ -727,6 +779,18 @@ mod tests {
             ("memory = \"8\"", "memory"),
             ("memory = \"0G\"", "memory"),
             ("memory = \"lots\"", "memory"),
+            ("[net]\nwrites = \"sometimes\"", "unknown variant"),
+            ("[net]\nallow_writes = [\"http://a.example.com/x\"]", "allow_writes"),
+            ("[net]\nallow_writes = [\"a.example.com/x\"]", "allow_writes"),
+            ("[net]\nallow_writes = [\"https://*.example.com/x\"]", "allow_writes"),
+            ("[net]\nallow_writes = [\"https://a.example.com/x?y=1\"]", "allow_writes"),
+            ("[net]\nallow_writes = [\"https://a.example.com:8443/x\"]", "allow_writes"),
+            ("standins = [\"gh_token\"]", "standins"),
+            ("standins = [\"GH TOKEN\"]", "standins"),
+            ("standins = [\"HTTPS_PROXY\"]", "set by cred already"),
+            ("standins = [\"ANTHROPIC_API_KEY\"]", "set by cred already"),
+            ("standins = [\"CLAUDE_CODE_OAUTH_TOKEN\"]", "set by cred already"),
+            ("standins = [\"GH_TOKEN\", \"GH_TOKEN\"]", "twice"),
             ("[net]\nallow = [\"http://a.example.com\"]", "https"),
             ("[net]\nallow = [\"http://localhost\"]", "https"),
             ("[net]\nallow = [\"https://a.example.com:8443\"]", "default port"),
@@ -758,6 +822,8 @@ mod tests {
     #[test]
     fn the_templates_are_valid_policies() {
         assert!(BoxPolicy::parse(&template("research", None)).is_ok());
+        let open = BoxPolicy::parse(&template("research", None)).unwrap();
+        assert_eq!((open.allow(), open.net.writes), (vec!["*".to_string()], Mode::Deny), "the open web, reads only");
         let p = BoxPolicy::parse(&template("research", Some(DIGEST))).unwrap();
         assert_eq!((p.image.as_deref(), p.model.as_deref(), p.keep), (Some(DIGEST), Some("anthropic"), true));
         assert!(template("research", None).contains("cred box approve research"));

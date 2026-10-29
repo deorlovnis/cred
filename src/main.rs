@@ -11,6 +11,7 @@ mod audit;
 mod boxes;
 mod browse;
 mod browser;
+mod chain;
 mod door;
 mod engine;
 mod fetch;
@@ -192,6 +193,9 @@ enum BoxCmd {
         /// How many of the latest lines to show
         #[arg(short = 'n', long, default_value_t = 50)]
         last: usize,
+        /// Check the whole log against its chain instead: fails at the first line that was changed or removed
+        #[arg(long)]
+        verify: bool,
     },
     /// Stop a running box and lock it
     Stop {
@@ -712,7 +716,7 @@ fn main() -> ExitCode {
             BoxCmd::Edit { name } => ok(boxes::edit(&name)),
             BoxCmd::Approve { names } => ok(boxes::approve(&names)),
             BoxCmd::Ls => ok(boxes::ls()),
-            BoxCmd::Log { name, last } => ok(boxes::log(&name, last)),
+            BoxCmd::Log { name, last, verify } => ok(boxes::log(&name, last, verify)),
             BoxCmd::Stop { name } => ok(boxes::stop(&name)),
             BoxCmd::Export { name, path, to } => ok(boxes::export(&name, &path, &to)),
             BoxCmd::Import { name, path } => ok(boxes::import(&name, &path)),
