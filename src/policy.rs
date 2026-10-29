@@ -64,6 +64,16 @@ pub enum Mode {
     Deny,
 }
 
+impl Mode {
+    pub fn text(self) -> &'static str {
+        match self {
+            Mode::Allow => "allow",
+            Mode::Ask => "ask",
+            Mode::Deny => "deny",
+        }
+    }
+}
+
 /// Where a field's fresh value comes from: an executable (pinned by hash) or a browser.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -274,6 +284,48 @@ pub struct Tool {
 }
 
 impl Policy {
+    /// What the policy allows in a few words, for listings: `run:ask fetch browse:ask`. The word
+    /// after a colon is the mode of `cred run`, or of writes where requests can also be sent.
+    pub fn summary(&self) -> String {
+        let with_writes = |name: &str, writes: Mode| if writes == Mode::Deny { name.to_string() } else { format!("{name}:{}", writes.text()) };
+        let mut parts = Vec::new();
+        if self.run.mode != Mode::Deny && !self.run.export.is_empty() {
+            parts.push(format!("run:{}", self.run.mode.text()));
+        }
+        parts.extend(self.fetch.as_ref().map(|f| with_writes("fetch", f.writes)));
+        parts.extend(self.browse.as_ref().map(|b| with_writes("browse", b.writes)));
+        if parts.is_empty() { "-".into() } else { parts.join(" ") }
+    }
+
+    /// What agents may do, as (label, text) lines for `cred info`.
+    pub fn rules(&self) -> Vec<(&'static str, String)> {
+        let consent = match self.agent.consent {
+            Consent::Session => "session (Touch ID on first use)",
+            Consent::None => "none",
+        };
+        let mut lines = vec![("agent", format!("consent {consent}"))];
+        if let Some(f) = &self.fetch {
+            let auth = f.auth.as_ref().map_or(String::new(), |_| format!("; auth in {}", f.auth_header));
+            lines.push(("fetch", format!("hosts {}; writes {}{auth}", f.hosts.join(", "), f.writes.text())));
+        }
+        for t in &self.tools {
+            lines.push(("tool", format!("{}: {}", t.name, t.request)));
+        }
+        if let Some(b) = &self.browse {
+            let mut text = format!("pages on {}", b.origins.join(", "));
+            if !b.requests.is_empty() {
+                text += &format!("; requests to {}", b.requests.join(", "));
+            }
+            text += &format!("; writes {}", b.writes.text());
+            if !b.allow_writes.is_empty() {
+                text += &format!(" (allowed: {})", b.allow_writes.join(", "));
+            }
+            text += if b.screenshots { "; screenshots" } else { "; no screenshots" };
+            lines.push(("browse", text));
+        }
+        lines
+    }
+
     pub fn parse(text: &str) -> Result<Self> {
         let policy: Policy = toml::from_str(text)?;
         policy.validate()?;
@@ -766,6 +818,19 @@ mod tests {
         assert!(dom.covers_cookie("example.com") && dom.covers_cookie("app.example.com") && !dom.covers_cookie("other.com"));
         let p = Policy::parse("[browse]\norigins = [\"https://*.example.com\"]\nrequests = [\"*\"]\nstart = \"https://app.example.com/\"\nscreenshots = true\ncookies = [{ name = \"s\", field = \"token\", domain = \".example.com\" }]").unwrap();
         assert_eq!(p.browse.unwrap().requests(), ["*"]);
+    }
+
+    #[test]
+    fn summarizes_what_a_policy_allows() {
+        let p = Policy::parse(GOOD).unwrap();
+        assert_eq!(p.summary(), "run:ask fetch:ask browse:ask");
+        assert_eq!(Policy::parse("[run]\nexport = { token = \"T\" }\n[fetch]\nhosts = [\"https://a.example.com\"]").unwrap().summary(), "fetch");
+        assert_eq!(Policy::parse("").unwrap().summary(), "-");
+        let rules = p.rules();
+        let line = |label: &str| rules.iter().find(|(l, _)| *l == label).map(|(_, t)| t.as_str()).unwrap();
+        assert_eq!(line("fetch"), "hosts https://api.example.com, http://127.0.0.1:8080; writes ask; auth in Authorization");
+        assert!(line("browse").contains("allowed: https://app.example.com/api/telemetry") && line("browse").contains("no screenshots"));
+        assert_eq!(line("tool"), "item: GET https://api.example.com/items/{id}?q={query}");
     }
 
     #[test]

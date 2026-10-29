@@ -325,7 +325,20 @@ fn cmd_info(res: &str) -> Result<()> {
     println!("{:<12} {res}", "name");
     println!("{:<12} {}", "url", r.url);
     println!("{:<12} {}", "description", r.description);
-    println!("{:<12} {} ({})", "policy", policy::status(res).text(), policy::path(res).display());
+    let status = policy::status(res);
+    println!("{:<12} {} ({})", "policy", status.text(), policy::path(res).display());
+    match &approved {
+        // Lines about what agents may do. Further ones (e.g. blocked browser writes) go here.
+        Some(a) => {
+            for (label, text) in a.policy.rules() {
+                println!("  {label:<10} {text}");
+            }
+        }
+        None if !matches!(status, policy::Status::Missing) => {
+            println!("  nothing in it applies until approved (cred policy approve {res})");
+        }
+        None => {}
+    }
     for (name, f) in &r.fields {
         let mut parts = vec![if keychain::exists(res, name) { "stored" } else { "MISSING" }.to_string()];
         let export = approved.as_ref().and_then(|a| a.policy.run.export.get(name));
@@ -366,7 +379,7 @@ fn field_status(res: &str, name: &str, f: &Field, auto: bool, warn: i64) -> (i64
 fn cmd_ls() -> Result<()> {
     let idx = Index::load()?;
     let warn = warn_days();
-    println!("{:<20} {:<9} {:<17} {:<34} DESCRIPTION", "RESOURCE", "STATUS", "EXPIRES", "FIELDS");
+    println!("{:<20} {:<9} {:<17} {:<34} {:<26} DESCRIPTION", "RESOURCE", "STATUS", "EXPIRES", "FIELDS", "POLICY");
     for (res, r) in &idx.map {
         let approved = policy::load(res).ok();
         let auto = |n: &str| approved.as_ref().is_some_and(|a| a.policy.refresh.contains_key(n));
@@ -390,7 +403,11 @@ fn cmd_ls() -> Result<()> {
                 None => n.clone(),
             })
             .collect();
-        println!("{res:<20} {status:<9} {expires:<17} {:<34} {}", fields.join(", "), r.description);
+        let policy = match &approved {
+            Some(a) => a.policy.summary(),
+            None => policy::status(res).text().to_string(),
+        };
+        println!("{res:<20} {status:<9} {expires:<17} {:<34} {policy:<26} {}", fields.join(", "), r.description);
     }
     Ok(())
 }
