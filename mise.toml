@@ -1,2 +1,10 @@
 [tools]
 rust = "stable"
+
+[tasks.e2e]
+description = "End-to-end tests of the built binary (no Touch ID, fake Keychain)"
+run = "cargo test --test e2e"
+
+[tasks.e2e-opt-in]
+description = "Also the browser (needs npm ci in runner/) and a real Touch ID approval (a human taps)"
+run = "cd runner && npm ci --ignore-scripts --no-audit --no-fund --silent && cd .. && CRED_E2E_BROWSER=1 CRED_E2E_INTERACTIVE=1 cargo test --test e2e -- --ignored --test-threads=1"
