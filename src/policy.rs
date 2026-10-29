@@ -82,11 +82,24 @@ pub struct Refresh {
     pub from: Option<String>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Agent {
     #[serde(default)]
     pub consent: Consent,
+    /// How long a consent lasts, if the MCP server stays connected. 0: until it disconnects.
+    #[serde(default = "default_consent_minutes")]
+    pub consent_minutes: u64,
+}
+
+impl Default for Agent {
+    fn default() -> Self {
+        Self { consent: Consent::default(), consent_minutes: default_consent_minutes() }
+    }
+}
+
+fn default_consent_minutes() -> u64 {
+    240
 }
 
 #[derive(Deserialize, Default, Clone, Copy, PartialEq, Debug)]
@@ -144,6 +157,20 @@ pub struct Browse {
     /// Lets the agent take screenshots. Masking can't reach text inside an image.
     #[serde(default)]
     pub screenshots: bool,
+    /// The browser closes after this long without a call. 0: never.
+    #[serde(default = "default_idle_minutes")]
+    pub idle_minutes: u64,
+    /// The browser closes this long after it opened, however busy. 0: never.
+    #[serde(default = "default_max_minutes")]
+    pub max_minutes: u64,
+}
+
+fn default_idle_minutes() -> u64 {
+    10
+}
+
+fn default_max_minutes() -> u64 {
+    60
 }
 
 /// A cookie set from a stored field, e.g. the session token.
@@ -716,6 +743,7 @@ export = {}            # field = "ENV_VAR", e.g. { token = "RES_TOKEN" }
 
 [agent]
 consent = "session"    # session: Touch ID once per agent session | none
+consent_minutes = 240  # a session consent lapses after this long (0: only when the agent disconnects)
 
 # [refresh.token]
 # run = "~/.config/cred/refresh/RES.sh"     # prints a fresh value; gets the fields that
@@ -778,6 +806,16 @@ mod tests {
         assert_eq!(p.agent.consent, Consent::Session);
         assert_eq!(p.tools[0].params(), ["id", "query"]);
         assert_eq!(Policy::parse("").unwrap().run.mode, Mode::Deny);
+    }
+
+    #[test]
+    fn time_limits_default_and_can_be_set() {
+        let p = Policy::parse(GOOD).unwrap();
+        assert_eq!((p.agent.consent_minutes, p.browse.unwrap().idle_minutes), (240, 10));
+        assert_eq!(Policy::parse("").unwrap().agent.consent_minutes, 240);
+        let p = Policy::parse("[agent]\nconsent_minutes = 0\n[browse]\norigins = [\"*\"]\nidle_minutes = 3\nmax_minutes = 30").unwrap();
+        let b = p.browse.unwrap();
+        assert_eq!((p.agent.consent_minutes, b.idle_minutes, b.max_minutes), (0, 3, 30));
     }
 
     #[test]

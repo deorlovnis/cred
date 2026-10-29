@@ -57,6 +57,7 @@ cred run -s github -- gh api user            # if the policy allows: exported fi
 cred ls                                      # one row per resource, with a summary of its policy
 cred info github                             # fields, expiry, refresh, and what the approved policy allows
 cred check                                   # expired / expiring within 14 days
+cred audit                                   # what agents did through cred mcp (never values)
 ```
 
 `cred copy RES FIELD` asks for Touch ID. `cred describe RES` edits the link and description, and `cred rm RES [FIELD]` deletes. Put resource names (one per line) in a `.cred` file in a repo and `cred run -- CMD` loads them. `cred --help` lists everything.
@@ -78,6 +79,7 @@ run = "~/.config/cred/refresh/app.sh"          # prints a fresh value
 
 [agent]
 consent = "session"                            # Touch ID before an agent session first uses it
+consent_minutes = 240                          # ...and again after this long (0: only after a reconnect)
 
 [fetch]
 hosts = ["https://api.example.com"]            # the only hosts cred sends credentials to
@@ -113,7 +115,13 @@ The agent gets these tools:
 - One tool per `[[tool]]` in the policies.
 - The `browse_*` tools, for sites whose policy has a `[browse]` section (see Browsing).
 
-Results are masked: the resource's values, and anything shaped like a JWT. Writes follow the policy's `writes` rule. When the policy asks for consent, a site's first use in a session needs your Touch ID.
+Results are masked: the resource's values, and anything shaped like a JWT. Writes follow the policy's `writes` rule. When the policy asks for consent, a site's first use in a session needs your Touch ID. The consent lapses after `consent_minutes` (default 240; 0 keeps it until the agent disconnects), and the next use asks again.
+
+### Audit log
+
+Every call an agent makes through `cred mcp` is appended to `~/.config/cred/audit.log` once it has run, before the agent gets the result. If the log can't be opened or written (say, its Keychain key is unreadable), the agent gets an error instead. One JSON line per call: time, site, tool, method, URL and decision: `allowed`, `asked:yes` or `asked:no` (you were asked, and answered), or `blocked` (refused by the policy, or failed before an answer). Never values, headers, bodies or typed text. URLs are masked like everything else the agent sees, and lose any user, password and `#fragment`; query values that look like secrets (keys like `token`, `key`, `code`, or long opaque strings) and opaque path segments become `********`.
+
+Each line carries an HMAC over its content and the previous line's, keyed by an item in the Keychain (`cred:_audit/hmac`, created on first use). `cred audit` shows the latest entries (`-n 50` for more); `cred audit --verify` reads the whole log and reports the first line where the chain breaks, so an edited, swapped or removed line shows. Cutting lines off the end can't be seen. Same-user limit: whoever can read the key from the Keychain (a program running as you, with your approval of a prompt) could forge a chain.
 
 ## Browsing
 
@@ -127,13 +135,15 @@ writes = "ask"                                 # requests other than GET from pa
 allow_writes = ["https://app.example.com/api/telemetry"]   # URL prefixes allowed without asking
 start = "https://app.example.com/home"
 screenshots = true                             # let the agent see the page as an image (can't be masked)
+idle_minutes = 10                              # the browser closes after this long without a call (0: never)
+max_minutes = 60                               # ...and this long after it opened, however busy (0: never)
 cookies = [{ name = "session", field = "token", domain = ".example.com" }]
 local_storage = [{ origin = "https://app.example.com", key = "jwt", field = "token" }]
 ```
 
 Sites can be exact (`https://app.example.com`), a domain with its subdomains (`https://*.example.com`), or `"*"` for any https site. Requests to other hosts are blocked, service workers are off, and downloads are refused. Cookies only go to the domain the policy names. The runner (`runner/`, pinned `playwright-core`) is installed root-owned by `install.sh`; it uses Playwright's Chromium headless shell from `~/Library/Caches/ms-playwright`.
 
-A `browse_open` waits for your Touch ID when the site's first use in a session needs consent, so it can take as long as you take to answer.
+A browser closes by itself after `idle_minutes` without a call, and `max_minutes` after it opened; the agent then needs `browse_open` again. A `browse_open` waits for your Touch ID when the site's first use in a session needs consent, so it can take as long as you take to answer.
 
 ## What cred protects, and what it doesn't
 
