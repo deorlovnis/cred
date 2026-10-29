@@ -58,8 +58,6 @@ dir, no reading the home folder beyond what the browser needs.
   store them encrypted (key in the Keychain), so sessions the site rotates aren't lost.
 - `browse_fill_credential(ref, field)`: cred types a stored login into the page itself, only on
   the site's own origin, for sites without a session to inject.
-- More session sources: Firefox cookies (`cookies.sqlite`), Chrome (needs the Keychain key that
-  encrypts its cookies).
 
 ## 8. Small things
 

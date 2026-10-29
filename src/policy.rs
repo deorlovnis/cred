@@ -627,6 +627,7 @@ consent = "session"    # session: Touch ID once per agent session | none
 # run = "~/.config/cred/refresh/RES.sh"     # prints a fresh value; gets the fields that
 #                                           # aren't exported as CRED_<FIELD>
 # from = "firefox:https://example.com#key"  # or: read it from Firefox Local Storage
+#                                           # (firefox-cookie:… and chrome-cookie:… read a cookie)
 
 # [fetch]
 # hosts = ["https://api.example.com"]

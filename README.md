@@ -72,6 +72,7 @@ export = { token = "APP_TOKEN" }               # fields cred run exports, as env
 
 [refresh.session]
 from = "firefox:https://app.example.com#session_token"   # read from Firefox Local Storage
+                                               # (or firefox-cookie:… / chrome-cookie:… for a cookie)
 
 [refresh.token]
 run = "~/.config/cred/refresh/app.sh"          # prints a fresh value
@@ -95,7 +96,7 @@ request = "GET https://api.example.com/items/{id}"
 - `cred policy approve` prints the policy and pins its sha256, and each refresh script's, in the Keychain. If the policy or a script changes afterwards, or the approval wasn't written by cred, the resource is blocked until you approve again.
 - Refresh scripts get the fields that aren't exported (login, session) as `CRED_<FIELD>`. They run from a private copy of the approved bytes.
 - A field refreshes in the last 5 minutes before its exact expiry, on its expiry date if only the date is known, or daily if its expiry is unknown. This happens before `cred run` or an agent uses it, and during `cred check`. JWT values get their exact expiry from the token.
-- `from` handles logins only a browser can do (Google sign-in, other SSO): sign in on the site in Firefox, and cred reads the session it keeps. Firefox only for now (default profile; `CRED_FIREFOX_PROFILE` overrides).
+- `from` handles logins only a browser can do (Google sign-in, other SSO): sign in on the site in a browser, and cred reads the session it keeps. `firefox:ORIGIN#KEY` reads a Local Storage key, `firefox-cookie:ORIGIN#NAME` a cookie from Firefox (default profile; `CRED_FIREFOX_PROFILE` overrides), and `chrome-cookie:ORIGIN#NAME` a cookie from Chrome's Default profile (`CRED_CHROME_PROFILE` overrides). Chrome encrypts its cookies with a key kept in the Keychain as "Chrome Safe Storage", so macOS asks for your login password the first time cred reads it (Always Allow stops that).
 
 ## Agents
 
