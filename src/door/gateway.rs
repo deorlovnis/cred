@@ -129,6 +129,7 @@ fn plan(sh: &Shared, head: &Head, method: &str, target: &str) -> Result<Plan, De
         return Err(denied(401, "blocked:no-standin", format!("send {STANDIN} as the key; cred adds the real one")));
     }
     let approved = policy::load(model).map_err(|e| denied(403, "blocked:policy", format!("{e:#}")))?;
+    crate::refresh::refresh_due(std::slice::from_ref(model), false, false);
     let fetch = approved
         .policy
         .fetch

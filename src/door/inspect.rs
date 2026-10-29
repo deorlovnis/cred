@@ -209,6 +209,8 @@ fn site_for(sh: &Shared, host: &str) -> Result<Option<Site>> {
 }
 
 fn site_of(name: &str, fetch: &Fetch) -> Result<Site> {
+    // Fields that expire are renewed first, as cred's own fetch does.
+    crate::refresh::refresh_due(&[name.to_string()], false, false);
     let mut secrets = Index::load().map(|index| index.values(name)).unwrap_or_default();
     let mut headers: Vec<(String, String)> = fetch.headers.iter().map(|(n, v)| (n.clone(), v.clone())).collect();
     if let Some(template) = &fetch.auth {
