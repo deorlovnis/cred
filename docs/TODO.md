@@ -13,10 +13,10 @@ keep files) but can't get out. Design: [box-design.md](box-design.md).
 - Data lives in an AES-256 store keyed from the Keychain; `cred box rm` deletes the key.
 - Covers the former items "OS sandbox around the browser", "supply chain of the browser" and the
   encrypted session vault, and parts of the audit log and idle timeouts (for boxes).
-- Decisions are settled and phase 0 passed (results in the design). Phase 1 is built and passed
-  its "Done when" checks on a real install (2026-10-29), except `sites`/`fetch` through a box
-  with a real site, and an interactive session. Next: those two, then phase 2 (the smart door:
-  TLS at the door, reads vs writes, `allow = ["*"]`).
+- Phases 0–2 are built and passed their "Done when" checks on a real install (2026-10-29;
+  results in the design). Open from phase 2: WebSockets through the door; the log-head check
+  live (next install). Next: phase 3 (the browser in the box, sealed sessions), phase 4
+  (hardening).
 - Done when: phases 1–3 of the design pass their "Done when" tests.
 
 ## 2. Approvals that survive updates
