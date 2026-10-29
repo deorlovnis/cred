@@ -17,8 +17,6 @@ keep files) but can't get out. Design: [box-design.md](box-design.md).
   a VM with no network reaches cred only through a published socket; Claude Code runs on the
   subscription through the door with only a stand-in inside; stores, Chromium and Docker work
   in VMs. Next: phase 1 (spike 6, Secure Enclave keys, only matters for phase 4).
-- The runner on the Mac runs Chromium without its sandbox today: Playwright adds
-  `--no-sandbox` unless `chromiumSandbox: true` is passed to `chromium.launch`. Fix that now.
 - Done when: phases 1–3 of the design pass their "Done when" tests.
 
 ## 2. Approvals that survive updates

@@ -174,7 +174,8 @@ const locate = (ref) => {
 const commands = {
   async open(msg) {
     config = msg.config;
-    browser = await chromium.launch({ headless: true });
+    // Playwright passes --no-sandbox unless asked for Chromium's own sandbox.
+    browser = await chromium.launch({ headless: true, chromiumSandbox: true });
     context = await browser.newContext({
       serviceWorkers: 'block',
       acceptDownloads: false,
