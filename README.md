@@ -116,7 +116,11 @@ Results are masked: the resource's values, and anything shaped like a JWT. Write
 
 ## Browsing
 
-For sites an agent should use the way a person does, add a `[browse]` section. cred starts a headless Chromium (one per site, profile in memory only), puts the session into it from stored fields, and lets the agent steer it with `browse_open`, `browse_goto`, `browse_snapshot`, `browse_click`, `browse_type`, `browse_press`, `browse_back`, `browse_screenshot` (if the policy allows it) and `browse_close`. The agent gets the page's accessibility tree with element refs, masked. It never gets the login, cookies, storage, request headers, or a way to run JavaScript.
+For sites an agent should use the way a person does, add a `[browse]` section. cred starts a headless Chromium (one per site, profile in memory only), puts the session into it from stored fields, and lets the agent steer it with `browse_open`, `browse_goto`, `browse_snapshot`, `browse_find`, `browse_click`, `browse_type`, `browse_press`, `browse_back`, `browse_requests`, `browse_screenshot` (if the policy allows it) and `browse_close`. The agent gets the page's accessibility tree with element refs, masked. It never gets the login, cookies, storage, request headers, or a way to run JavaScript.
+
+- Pages can be large: `browse_snapshot` takes `compact` (one short line per named element) or `ref` (just that element), and `browse_find(text)` returns only the elements whose name or text match, with their refs.
+- After a click (or Enter), cred waits up to 3 seconds for the URL or the page's text to change, so single-page apps return the new view.
+- `browse_requests` lists the data requests (XHR/fetch: method and URL, never headers or bodies; query values over 16 characters left out) the pages made, so the agent can find the API behind a view and use `fetch` instead of scraping.
 
 ```toml
 [browse]
@@ -131,6 +135,8 @@ local_storage = [{ origin = "https://app.example.com", key = "jwt", field = "tok
 ```
 
 Sites can be exact (`https://app.example.com`), a domain with its subdomains (`https://*.example.com`), or `"*"` for any https site. Requests to other hosts are blocked, service workers are off, and downloads are refused. Cookies only go to the domain the policy names. The runner (`runner/`, pinned `playwright-core`) is installed root-owned by `install.sh`; it uses Playwright's Chromium headless shell from `~/Library/Caches/ms-playwright`.
+
+Writes that pages try without an `allow_writes` rule (a telemetry POST on every page load, say) are blocked or asked about, and remembered without their query or body: `cred info SITE` lists them, so you can add the harmless ones to `allow_writes`. The page tools mention this when a write was blocked.
 
 A `browse_open` waits for your Touch ID when the site's first use in a session needs consent, so it can take as long as you take to answer.
 

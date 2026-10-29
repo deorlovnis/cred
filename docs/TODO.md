@@ -40,18 +40,6 @@ dir, no reading the home folder beyond what the browser needs.
   `~/Library/Caches/ms-playwright` (user-writable). Pin both: check the Chromium binary's hash
   at start, or install Node and the browser root-owned next to the runner.
 
-## 6. Browser usability
-
-- Single-page apps: after `browse_click`, wait for the URL or content to change before taking
-  the snapshot (a click on a client-side link returned the old page).
-- Snapshots can be very large (60 KB). Add a compact mode, a snapshot of one element by ref, or
-  `browse_find(text)`.
-- Report the data requests a page made (URLs only, never headers), so an agent can find the API
-  behind a view and use `fetch` instead of scraping.
-- Writes from pages: a POST each page load (telemetry) means a Touch ID prompt each time with
-  `writes = "ask"`. Make `allow_writes` easier to discover, e.g. by listing blocked writes in
-  `cred info`.
-
 ## 7. Sessions (rest of design step 2)
 
 - Encrypted session vault: capture the browser's updated cookies/storage on `browse_close` and
