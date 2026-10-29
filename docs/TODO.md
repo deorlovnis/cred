@@ -60,9 +60,3 @@ dir, no reading the home folder beyond what the browser needs.
   the site's own origin, for sites without a session to inject.
 - More session sources: Firefox cookies (`cookies.sqlite`), Chrome (needs the Keychain key that
   encrypts its cookies).
-
-## 8. Small things
-
-- `cred info` and `cred ls`: show browse and fetch rules from the approved policy.
-- Policy `edit`: show a diff against the approved version before approving.
-- Run the end-to-end tests (`e2e`) from the repo instead of ad-hoc scripts.

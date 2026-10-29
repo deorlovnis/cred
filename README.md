@@ -50,12 +50,12 @@ Items cred writes itself, policy approvals included, stay tied to the exact buil
 ```sh
 cred set github token --expires 2027-01-31   # hidden prompt; asks for link/description
 cred update github token                     # rotate: copy the new token, run this
-cred policy edit github                      # write the policy (template on first use)
+cred policy edit github                      # write the policy; shows a diff against the approved one
 cred policy approve github                   # Touch ID; until then the policy has no effect
 cred policy approve                          # all policies, one Touch ID (install.sh runs this)
 cred run -s github -- gh api user            # if the policy allows: exported fields as env vars
-cred ls                                      # one row per resource — never values
-cred info github                             # fields, policy, expiry, refresh
+cred ls                                      # one row per resource, with a summary of its policy
+cred info github                             # fields, expiry, refresh, and what the approved policy allows
 cred check                                   # expired / expiring within 14 days
 ```
 
@@ -92,6 +92,8 @@ about = "Get one item"
 request = "GET https://api.example.com/items/{id}"
 ```
 
+- `cred ls` and `cred info` show what the *approved* policy allows. In `ls`, `run:ask fetch browse:ask` means `cred run` asks, requests are allowed (writes denied), and pages may send writes after asking: a mode after a colon is the rule for writes, or for `cred run`. A policy that isn't approved, or changed since, shows as such instead, and none of it applies.
+- `cred policy edit` shows what your edit changed compared to the approved version (a colored diff in a terminal) and offers to approve it.
 - `cred policy approve` prints the policy and pins its sha256, and each refresh script's, in the Keychain. If the policy or a script changes afterwards, or the approval wasn't written by cred, the resource is blocked until you approve again.
 - Refresh scripts get the fields that aren't exported (login, session) as `CRED_<FIELD>`. They run from a private copy of the approved bytes.
 - A field refreshes in the last 5 minutes before its exact expiry, on its expiry date if only the date is known, or daily if its expiry is unknown. This happens before `cred run` or an agent uses it, and during `cred check`. JWT values get their exact expiry from the token.
@@ -155,3 +157,12 @@ Deny direct Keychain and clipboard reads in `~/.claude/settings.json` too:
 ```
 
 Metadata (never values) is kept in `~/.config/cred/index.json`; `CRED_INDEX` overrides it, and `CRED_POLICY_DIR` the policy folder. `CRED_WARN_DAYS` sets the warning window.
+
+## Development
+
+```sh
+mise run e2e         # end-to-end tests: the built binary, a local test site, `cred run` and `cred mcp`
+mise run e2e-opt-in  # also the sandboxed browser, and one real Touch ID approval (you tap)
+```
+
+`cargo test` runs the unit tests and the same end-to-end tests. Debug builds keep Keychain items in a temp folder when `CRED_TEST_KEYCHAIN` is set and take `CRED_TEST_APPROVE=yes|no` as the Touch ID answer, so those tests need no human and never touch your Keychain; release builds contain neither. The opt-in tests are `#[ignore]`d: the browser one needs `npm ci` in `runner/` and Playwright's Chromium (`install.sh` fetches it), and the Touch ID one uses the real Keychain with a throwaway resource name and removes it afterwards.
