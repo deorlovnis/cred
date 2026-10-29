@@ -104,7 +104,10 @@ impl World for Real {
     }
 
     fn exec(&self, vm: &str, env: &[(String, String)], cmd: &[String], tty: bool) -> Result<ExitStatus> {
-        engine::exec(vm, env, cmd, tty)
+        let status = engine::exec(vm, env, cmd, tty);
+        // `container exec` shares the terminal and may leave it non-blocking.
+        crate::util::blocking_stdio();
+        status
     }
 }
 

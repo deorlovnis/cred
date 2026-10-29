@@ -690,6 +690,7 @@ fn cmd_run(mut resources: Vec<String>, command: Vec<String>) -> Result<u8> {
 }
 
 fn main() -> ExitCode {
+    util::blocking_stdio();
     let ok = |r: Result<()>| r.map(|_| 0);
     let result = match Cli::parse().cmd {
         Cmd::Set { resource, field, expires, meta } => ok(cmd_set(&resource, &field, expires, meta)),
