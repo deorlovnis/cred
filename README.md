@@ -27,6 +27,18 @@ cred check                                   # expired / expiring within 14 days
 cred run -s GITHUB_TOKEN -- gh api user      # run with the secret injected and masked
 ```
 
+### Auto-refresh
+
+For short-lived tokens, give `cred` a command that prints a fresh value:
+
+```sh
+cred auto APP_TOKEN --cmd 'cred run -s APP_EMAIL -s APP_PASSWORD -- ~/.config/cred/refresh/app.sh'
+cred auto APP_TOKEN --off                    # stop
+cred refresh [NAME] [--force]                # refresh now if due
+```
+
+A secret is refreshed when it's within an hour of expiring, or daily if its expiry is unknown. This happens automatically right before `cred run` uses it, and during `cred check`. JWT values have their exact expiry read from the token.
+
 Put names (one per line) in a `.cred` file in a repo and `cred run -- CMD` loads them. `cred --help` and `cred <command> --help` list everything.
 
 Metadata (expiry, link, description — never values) is kept in `~/.config/cred/index.json`; override with `CRED_INDEX`. `CRED_WARN_DAYS` sets the warning window.

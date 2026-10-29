@@ -7,6 +7,7 @@ description = "macOS Keychain-backed secrets for humans and agents"
 [dependencies]
 aho-corasick = "1.1"
 anyhow = "1.0"
+base64 = "0.22"
 clap = { version = "4.6", features = ["derive"] }
 jiff = { version = "0.2", features = ["serde"] }
 rpassword = "7.5"
