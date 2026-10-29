@@ -143,7 +143,7 @@ pub fn mask_url(raw: &str, masker: &Masker) -> String {
     clip(&masker.mask(url.as_str()), MAX_URL)
 }
 
-fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> String {
+pub fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> String {
     let mut block = [0u8; 64];
     if key.len() > 64 {
         block[..32].copy_from_slice(&Sha256::digest(key));

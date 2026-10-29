@@ -158,7 +158,7 @@ A browser closes by itself after `idle_minutes` without a call, and `max_minutes
 
 ## Boxes
 
-A **box** is an isolated, encrypted place where an agent works: a Linux VM with no network of its own, whose only way out is a door cred keeps. The agent can do any work a person at a computer could (run code, install packages, keep files) but can't see your Mac, your Keychain or any credential. What it keeps is in an AES-256 store whose key lives in the Keychain; deleting the key destroys the box. Phase 1 (this section) covers boxes that reach listed sites; the open web with read-only rules, and the browser inside the box, come later.
+A **box** is an isolated, encrypted place where an agent works: a Linux VM with no network of its own, whose only way out is a door cred keeps. The agent can do any work a person at a computer could (run code, install packages, keep files) but can't see your Mac, your Keychain or any credential. What it keeps is in an AES-256 store whose key lives in the Keychain; deleting the key destroys the box. The door sees every request the agent makes, so a box can read the open web while its writes stay under your rules; the browser inside the box comes later.
 
 ```sh
 cred box new research              # policy template in $EDITOR, a new key in the Keychain, an empty store
@@ -167,7 +167,8 @@ cred box run research              # Touch ID opens it; you're in Claude Code, i
 cred box run research -- bash      # a shell in the same box (joins it if it's running)
 cred box run --temp research       # a throwaway box with research's policy, gone when it stops
 cred box ls                        # open or locked, policy status, size, sites, last used
-cred box log research              # what went through the door
+cred box log research              # what went through the door: a line per request, chained
+cred box log research --verify     # checks the chain; names the first line that was changed or removed
 cred box export research work/report.md --to ~/Desktop   # Touch ID; lists each file with size and sha256
 cred box import research ~/data.csv                      # copy a file or folder into work/ (box stopped)
 cred box stop research             # stop and lock; also happens when `run` ends or on Ctrl-C
@@ -184,12 +185,15 @@ run = ["claude"]                        # what `cred box run` starts; `-- CMD` r
 image = "cred-agent@sha256:..."         # the system inside, pinned by digest: a new image is a policy change
 model = "anthropic"                     # resource whose key cred adds to the agent's model calls
 sites = ["github", "app"]               # resources the agent may use through cred; their policies apply
+standins = ["GH_TOKEN"]                 # variables set to "cred-managed", for tools that won't start without a token
 keep = true                             # false: a new store every run, shredded when it stops, key never kept
 cpus = 4
 memory = "8G"
 
 [net]
-allow = ["https://*.wikipedia.org", "https://docs.rs"]   # the only sites the agent's own requests reach; "*" = any public https site
+allow = ["*"]                           # the sites the agent's own requests reach: any public https site, or a list like ["https://*.wikipedia.org"]
+writes = "deny"                         # requests that aren't reads, to hosts no site covers: deny | ask (Touch ID each) | allow
+allow_writes = ["https://api.example.com/search"]   # URL prefixes that may receive writes anyway
 
 [[mount]]                               # holes in the box: none unless listed
 path = "~/Git/project"
@@ -198,7 +202,10 @@ mode = "clone"                          # clone: the agent works on its own copy
 
 - A box policy works like a resource policy: no effect until approved, a change blocks the box until approved again, and `cred box edit` shows a diff against the approved version. The approval is kept under the Keychain name `box.NAME` (resource names can't contain a dot, so it never collides with a resource).
 - One Touch ID at `run` opens the box and covers consent for its `sites`. Their own policies still decide hosts, writes and what may be browsed. `model` names a resource with a `[fetch]` policy: cred forwards the agent's model calls to its host with the real key, and the agent only has a stand-in. Joining a running box (`run NAME -- CMD` from another terminal) asks nothing more.
-- **Phase 1 limits.** The door sees host names, not requests: an allowed site gets whatever the agent sends it, so list sites you trust. `[net] writes` and `allow_writes` belong to phase 2 and `[browser]` to phase 3; the policy is refused if it sets them, rather than promising rules the door can't keep. `rw` mounts aren't offered: files come in with `clone` or `import` and go out with `export`.
+- **Reads and writes.** The door ends TLS for the agent's connections, with a certificate authority made for that box and trusted only inside it, and judges each request. Reads (GET, HEAD, OPTIONS, and the POST that `git fetch` and `git clone` send to `.../git-upload-pack`) go to any site `allow` lets the box reach. Every other request is a write, and so is anything that asks to switch protocols (WebSocket). A write to a host no `sites` entry covers follows `[net] writes`; `allow_writes` lists URL prefixes that may receive writes whatever `writes` says (`https://api.example.com/search` covers `/search` and `/search/x`, not `/searching` or another host that starts alike; `/..` is resolved first). A refused request gets a `403` that says why, and the connection stays usable. With `ask`, a write waits for your Touch ID, which names the box, the method and the URL with secrets masked. A WebSocket can't be carried through the door yet, so it is refused even where writes are allowed. `[browser]` belongs to phase 3 and is refused until then. `rw` mounts aren't offered: files come in with `clone` or `import` and go out with `export`.
+- **Credentials for any tool.** On the hosts of a `sites` entry (its `[fetch] hosts`), the door adds the site's `auth` header and fixed `headers` to every request, whatever tool sent it, replacing anything the agent sent; the site's `writes` rule decides writes there instead of `[net]`. The agent never holds the token: `standins` sets variables such as `GH_TOKEN` to `cred-managed` so tools that insist on one start, and the door puts the real credential on the wire. The site's policy is read from its approved copy at each request: a policy that changed or was revoked gives no credentials, and its writes fall back to `[net]`. Answers from those hosts are masked with the site's stored values as they stream (a value split across reads is still found), are sent chunked because masking changes their length, and are asked for uncompressed; a site that compresses anyway is refused with a `502`, since cred can't mask what it can't read. Other hosts' answers pass as they are.
+- **The log.** `cred box log` shows one line per request (time, host, method, URL with tokens and long ids masked, status, bytes, decision: `allowed`, `asked:yes`, `asked:no`, `blocked:<why>`), never headers or bodies, along with a line per connection and per export and import. Each line carries an HMAC over itself and the line before, with a key derived from the box key, so `--verify` shows a line that was edited or taken out of the middle. Cutting off the end can't be seen. A log from before it was chained stays readable; its lines are reported as unchecked.
+- The `Host` header of every request must be the host the connection is for; otherwise the request is refused and the connection ends, so a connection to one allowed host can't be used to ask another.
 - Mounts: `clone` copies the folder (with its `.git`) into the box's `work/` on the first run, and the agent keeps its own copy after. `ro` mounts the folder itself read-only. Folders that hold cred's own files, your home folder and `/` are refused.
 - Inside, `/home/agent`, `/work` and `/downloads` are folders of the store; `/tmp` is memory. The agent starts in `/work`. On each run cred makes sure Claude Code's settings skip the web-fetch check and know cred's tools (`cred-shim mcp`), keeping anything else the agent put in those files.
 - The store is an APFS sparse bundle in `~/Library/Application Support/cred/box/`, opened with the key on `hdiutil`'s stdin into a private folder, hidden from Finder and Spotlight, and only while the box runs. A store never shrinks when files are deleted (`hdiutil compact` doesn't work on APFS images).

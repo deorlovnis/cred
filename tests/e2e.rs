@@ -583,7 +583,8 @@ fn box_policy_approve_with_no_names_covers_boxes_too() {
 fn box_new_refuses_policies_the_door_cannot_keep() {
     let env = Env::new();
     for (toml, why) in [
-        ("[net]\nwrites = \"allow\"\n", "phase 2"),
+        ("[net]\nallow_writes = [\"http://a.example.com/x\"]\n", "allow_writes"),
+        ("standins = [\"HTTPS_PROXY\"]\n", "set by cred already"),
         ("[browser]\nkeep_sessions = true\n", "phase 3"),
         ("[[mount]]\npath = \"/opt/data\"\nmode = \"rw\"\n", "rw isn't available"),
         ("nope = 1\n", "unknown field"),
@@ -638,6 +639,73 @@ fn box_import_export_and_log_go_through_touch_id_and_stay_in_the_box() {
     fs::remove_file(out_dir.join("note.txt")).unwrap();
     let out = env.command().args(["box", "export", "research", "work/note.txt", "--to"]).arg(&out_dir).env("CRED_TEST_APPROVE", "no").output().unwrap();
     assert!(!out.status.success() && !out_dir.join("note.txt").exists());
+}
+
+impl Env {
+    /// Open the box's store as cred does (the key from the test Keychain on hdiutil's stdin), change
+    /// its log the way someone with the store open could, and close it again.
+    fn tamper_with_log(&self, name: &str, change: impl FnOnce(&str) -> String) {
+        struct Detach(PathBuf);
+        impl Drop for Detach {
+            fn drop(&mut self) {
+                let _ = Command::new("hdiutil").args(["detach", "-force"]).arg(&self.0).output();
+            }
+        }
+        let mnt = self.dir.join("tamper-mnt");
+        fs::create_dir_all(&mnt).unwrap();
+        let key = fs::read_to_string(self.box_key_path(name)).unwrap();
+        let mut attach = Command::new("hdiutil")
+            .args(["attach", "-stdinpass", "-nobrowse", "-noautoopen", "-owners", "on", "-mountpoint"])
+            .arg(&mnt)
+            .arg(self.box_store(name))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        attach.stdin.take().unwrap().write_all(&[key.as_bytes(), &[0]].concat()).unwrap();
+        let out = attach.wait_with_output().unwrap();
+        assert!(out.status.success(), "attach: {}", String::from_utf8_lossy(&out.stderr));
+        let _detach = Detach(mnt.clone());
+        let log = mnt.join("log/door.log");
+        let text = fs::read_to_string(&log).unwrap();
+        fs::write(&log, change(&text)).unwrap();
+    }
+}
+
+#[test]
+fn box_log_verify_finds_a_changed_line_and_a_missing_one() {
+    let env = Env::new();
+    env.new_box("research");
+    let empty = stdout(&env.boxed("true", &["log", "research", "--verify"]));
+    assert!(empty.contains("0 lines, chain intact"), "{empty}");
+
+    // Three things happen to the box: one import and two exports, each one line in its log.
+    let note = env.dir.join("note.txt");
+    fs::write(&note, "hello box\n").unwrap();
+    assert!(env.boxed("true", &["import", "research", note.to_str().unwrap()]).status.success());
+    for n in 1..=2 {
+        let to = env.dir.join(format!("out{n}"));
+        fs::create_dir(&to).unwrap();
+        let out = env.boxed("true", &["export", "research", "work/note.txt", "--to", to.to_str().unwrap()]);
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+    let shown = stdout(&env.boxed("true", &["log", "research"]));
+    assert!(shown.lines().all(|l| l.contains("\"mac\":\"")), "every line is chained:\n{shown}");
+    let verified = env.boxed("true", &["log", "research", "--verify"]);
+    assert!(verified.status.success() && stdout(&verified).contains("3 lines, chain intact"), "{} {}", stdout(&verified), stderr(&verified));
+
+    // An edited line is found, and named.
+    env.tamper_with_log("research", |text| text.replace("\"kind\":\"import\"", "\"kind\":\"imported\""));
+    let out = env.boxed("true", &["log", "research", "--verify"]);
+    assert!(!out.status.success() && stderr(&out).contains("chain breaks at line 1"), "{}", stderr(&out));
+    env.tamper_with_log("research", |text| text.replace("\"kind\":\"imported\"", "\"kind\":\"import\""));
+    assert!(env.boxed("true", &["log", "research", "--verify"]).status.success(), "restoring the line restores the chain");
+
+    // So is a line taken out of the middle.
+    env.tamper_with_log("research", |text| text.lines().enumerate().filter(|(i, _)| *i != 1).map(|(_, l)| format!("{l}\n")).collect());
+    let out = env.boxed("true", &["log", "research", "--verify"]);
+    assert!(!out.status.success() && stderr(&out).contains("chain breaks at line 2"), "{}", stderr(&out));
 }
 
 #[test]

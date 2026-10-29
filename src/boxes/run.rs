@@ -127,7 +127,10 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
     let policy = req.policy;
     let agent_env = || -> Result<Vec<(String, String)>> {
         let bearer = policy.model.as_deref().map(|m| world.model_uses_bearer(m)).transpose()?.unwrap_or(false);
-        Ok(engine::agent_env(bearer))
+        let mut env = engine::agent_env(bearer);
+        // For tools that won't start without a token; the door adds the real one on the sites' hosts.
+        env.extend(policy.standins.iter().map(|name| (name.clone(), door::STANDIN.to_string())));
+        Ok(env)
     };
     let command = guest_command(req.command.as_deref().unwrap_or(&policy.run));
 
@@ -165,6 +168,7 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
         store::create(layout, &bundle, &key)?;
         (bundle, key)
     };
+    let log_key = super::log_key(&key);
     let mut store = store::open(&bundle, &mnt, &key, false).inspect_err(|_| {
         if !req.persistent {
             let _ = store::shred(&bundle);
@@ -173,7 +177,7 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
     if !req.persistent {
         store.shred_on_close();
     }
-    let _ = store::log_event(&mnt, "box", &req.id, 0, "started");
+    let _ = store::log_event(&mnt, &log_key, "box", &req.id, 0, "started");
 
     // The folders are changed here, while no VM has them.
     prepare_home(&mnt.join("home"))?;
@@ -207,7 +211,9 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
         allow: policy.allow(),
         model: policy.model.clone(),
         sites: policy.sites.clone(),
+        net: door::inspect::Net { writes: policy.net.writes, allow_writes: policy.net.allow_writes.clone() },
         log: store::door_log(&mnt),
+        log_key,
     };
 
     // Declared in the order they start, so they drop in the order they must end: VM, door, store.
@@ -232,7 +238,7 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
         status
     });
 
-    let _ = store::log_event(&mnt, "box", &req.id, 0, "stopped");
+    let _ = store::log_event(&mnt, &log_key, "box", &req.id, 0, "stopped");
     drop(vm_guard);
     drop(door);
     drop(store);
@@ -397,6 +403,7 @@ mod tests {
 
     type SpecSeen = (String, String, u32, String, PathBuf, Vec<(PathBuf, String, bool)>, bool);
     type DoorSeen = (Vec<String>, Option<String>, Vec<String>, PathBuf);
+    type NetSeen = (policy::Mode, Vec<String>, [u8; 32]);
     type ExecSeen = (Vec<(String, String)>, Vec<String>, bool);
     type Hook = Box<dyn Fn(&Path) + Sync + Send>;
 
@@ -405,6 +412,7 @@ mod tests {
         calls: Vec<String>,
         spec: Option<SpecSeen>,
         door: Option<DoorSeen>,
+        net: Option<NetSeen>,
         exec: Option<ExecSeen>,
         /// Files of the box as the agent would find them, read when it starts.
         files: BTreeMap<String, String>,
@@ -472,7 +480,9 @@ mod tests {
             if self.door_fails {
                 bail!("the door can't start");
             }
-            self.seen.lock().unwrap().door = Some((cfg.allow, cfg.model, cfg.sites, cfg.log));
+            let mut seen = self.seen.lock().unwrap();
+            seen.net = Some((cfg.net.writes, cfg.net.allow_writes, cfg.log_key));
+            seen.door = Some((cfg.allow, cfg.model, cfg.sites, cfg.log));
             Ok(Box::new(()))
         }
 
@@ -551,8 +561,11 @@ mod tests {
             image = "{DIGEST}"
             model = "anthropic"
             sites = ["github"]
+            standins = ["GH_TOKEN"]
             [net]
             allow = ["https://docs.rs"]
+            writes = "ask"
+            allow_writes = ["https://api.example.com/search"]
             [[mount]]
             path = "{}"
             [[mount]]
@@ -604,6 +617,9 @@ mod tests {
 
         let (env, cmd, tty) = seen.exec.clone().unwrap();
         assert!(env.contains(&("CLAUDE_CODE_OAUTH_TOKEN".into(), "cred-managed".into())), "the bearer stand-in: {env:?}");
+        assert!(env.contains(&("GH_TOKEN".into(), "cred-managed".into())), "the policy's stand-ins: {env:?}");
+        let (writes, allow_writes, _) = seen.net.clone().unwrap();
+        assert_eq!((writes, allow_writes), (policy::Mode::Ask, vec!["https://api.example.com/search".to_string()]));
         assert_eq!(&cmd[..2], ["sh", "-c"]);
         assert!(cmd[2].starts_with("cd /work && exec"), "{}", cmd[2]);
         assert_eq!(&cmd[3..], ["bash", "-l"]);
@@ -624,9 +640,16 @@ mod tests {
         let p = policy(&s, "");
         let key = store::new_key().unwrap();
         store::create(&s.layout, &s.layout.bundle("r"), &key).unwrap();
-        let hook: Hook = Box::new(|work| fs::write(work.join("proj/README"), "agent's edit").unwrap());
+        let log_key = super::super::log_key(&key);
+        let hook: Hook = Box::new(move |work| {
+            fs::write(work.join("proj/README"), "agent's edit").unwrap();
+            // The line for the start is in the log, chained with the key the door gets.
+            let log = store::door_log(work.parent().unwrap());
+            assert_eq!(crate::chain::Chain::new(&log, log_key).verify().unwrap().chained, 1);
+        });
         let first = Fake { key: key.clone(), hook: Some(hook), ..Fake::default() };
         run(&s.layout, &first, &request(&s, &p, true)).unwrap();
+        assert_eq!(first.seen.lock().unwrap().net.as_ref().unwrap().2, log_key, "the door chains its log with a key derived from the box key");
         assert!(s.layout.bundle("r").exists() && !store::is_mounted(&s.layout.mount_point("r")));
 
         // The source changes; the agent's copy is not replaced.

@@ -29,6 +29,7 @@ use crate::{approve, keychain, policy};
 const REAL_KEY: &str = "sk-ant-REAL-0123456789abcdef";
 const PUBLIC_IP: &str = "93.184.216.34";
 const WAIT: Duration = Duration::from_secs(10);
+const LOG_KEY: [u8; 32] = [7; 32];
 
 // --- the scenario's environment ---
 
@@ -318,7 +319,9 @@ fn scenario(dir: &Path) {
             allow: vec!["https://allowed.example.com".into(), "https://*.wiki.example.org".into(), "https://rebind.example.com".into()],
             model: Some("anthropic".into()),
             sites: vec!["notes".into()],
+            net: Default::default(),
             log: log_path.clone(),
+            log_key: LOG_KEY,
         },
         net,
     )
@@ -501,7 +504,7 @@ fn model_refusals(dir: &Path) {
         let socket = dir.join("second.sock");
         let _ = fs::remove_file(&socket);
         let guest = Guest::new(&socket);
-        let config = Config { name: "second".into(), socket, allow: vec![], model: model.map(String::from), sites: vec![], log: dir.join("second.log") };
+        let config = Config { name: "second".into(), socket, allow: vec![], model: model.map(String::from), sites: vec![], net: Default::default(), log: dir.join("second.log"), log_key: LOG_KEY };
         let door = Door::start_with(config, Net::system()).unwrap();
         let mut conn = guest.connection("cred");
         conn.send(&post("/model/v1/messages", &[("x-api-key", "cred-managed")], "{}"));
@@ -565,7 +568,7 @@ fn live_door() {
     let allow = std::env::var("CRED_DOOR_ALLOW").unwrap_or_default().split(',').filter(|s| !s.is_empty()).map(String::from).collect();
     let seconds = std::env::var("CRED_DOOR_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
     let log = std::env::temp_dir().join(format!("cred-door-live-{}.log", std::process::id()));
-    let door = Door::start(Config { name: "live".into(), socket: socket.into(), allow, model: None, sites: vec![], log: log.clone() }).unwrap();
+    let door = Door::start(Config { name: "live".into(), socket: socket.into(), allow, model: None, sites: vec![], net: Default::default(), log: log.clone(), log_key: LOG_KEY }).unwrap();
     eprintln!("door log: {}", log.display());
     thread::sleep(Duration::from_secs(seconds));
     door.stop();
@@ -581,7 +584,9 @@ fn bad_allow_patterns_stop_the_door_from_starting() {
         allow: vec!["example.com".into()],
         model: None,
         sites: vec![],
+        net: Default::default(),
         log: dir.0.join("log"),
+        log_key: LOG_KEY,
     };
     let err = Door::start(cfg).err().expect("should fail");
     assert!(format!("{err:#}").contains("example.com"), "{err:#}");
