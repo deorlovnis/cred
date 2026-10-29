@@ -1,9 +1,10 @@
 //! cred — macOS Keychain-backed secrets for humans and agents.
 //!
-//! Values live only in the login Keychain (service "cred:<NAME>").
-//! Metadata (expiry, last update, resource link, description) lives in
-//! ~/.config/cred/index.json — never values. NAME is the env var the secret
-//! is injected as, e.g. GITHUB_TOKEN.
+//! Secrets are grouped by resource: one thing you sign in to (GitHub, AWS, …).
+//! A resource has fields — token, user, password, … — each its own Keychain item
+//! (service "cred:<resource>/<field>"). `cred run` exports only fields mapped to an
+//! env var; the rest (e.g. a login) stay inside cred and reach only the resource's
+//! refresh command. Metadata lives in ~/.config/cred/index.json — never values.
 
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
@@ -18,8 +19,8 @@ use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::{Args, Parser, Subcommand};
-use jiff::civil::Date;
 use jiff::Timestamp;
+use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use security_framework::passwords::{
     delete_generic_password, get_generic_password, set_generic_password,
@@ -30,7 +31,7 @@ const PREFIX: &str = "cred:";
 const MASK: &[u8] = b"********";
 /// Set while a refresh command runs, so a `cred run` inside it doesn't refresh again and loop.
 const REFRESHING: &str = "CRED_REFRESHING";
-/// Auto-refresh a secret once it is this close to expiring.
+/// Auto-refresh a field once it is this close to expiring.
 const REFRESH_MARGIN_SECS: i64 = 3600;
 
 #[derive(Parser)]
@@ -42,85 +43,133 @@ struct Cli {
 
 #[derive(Args, Default)]
 struct Meta {
-    /// Where the token is issued/rotated
+    /// Where the resource's credentials are issued/rotated
     #[arg(long)]
     url: Option<String>,
-    /// What the token is for
+    /// What the resource is
     #[arg(long, visible_alias = "note")]
     desc: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Store or rotate a secret (hidden prompt); also asks for link and description while they're empty
+    /// Store or rotate a field (hidden prompt); creates the resource and asks for what's missing
     Set {
-        #[arg(value_parser = parse_name)]
-        name: String,
+        #[arg(value_parser = parse_resource)]
+        resource: String,
+        #[arg(value_parser = parse_field)]
+        field: String,
+        /// Export this field to `cred run` as this env var
+        #[arg(long, value_parser = parse_env)]
+        env: Option<String>,
         #[arg(long, value_parser = parse_date)]
         expires: Option<Date>,
         #[command(flatten)]
         meta: Meta,
     },
-    /// Replace NAME with the clipboard contents, then clear the clipboard
+    /// Replace a field with the clipboard contents, then clear the clipboard
     #[command(visible_alias = "rotate")]
     Update {
-        #[arg(value_parser = parse_name)]
-        name: String,
+        #[arg(value_parser = parse_resource)]
+        resource: String,
+        #[arg(value_parser = parse_field)]
+        field: String,
         #[arg(long, value_parser = parse_date)]
         expires: Option<Date>,
-        #[command(flatten)]
-        meta: Meta,
     },
-    /// Change link/description only ("" clears; no flags = prompt)
+    /// Export a field to `cred run` as VAR, or --off to keep it inside cred
+    Env {
+        #[arg(value_parser = parse_resource)]
+        resource: String,
+        #[arg(value_parser = parse_field)]
+        field: String,
+        #[arg(value_parser = parse_env, required_unless_present = "off", conflicts_with = "off")]
+        var: Option<String>,
+        #[arg(long)]
+        off: bool,
+    },
+    /// Change a resource's link/description ("" clears; no flags = prompt)
     Describe {
-        #[arg(value_parser = parse_name)]
-        name: String,
+        #[arg(value_parser = parse_resource)]
+        resource: String,
         #[command(flatten)]
         meta: Meta,
     },
-    /// Turn automatic refresh on (--cmd) or off (--off) for NAME; no flags shows the setting
+    /// Refresh a field automatically (--cmd) or stop (--off); no flags shows the setting
+    #[command(after_help = "The command must print the new value on stdout. It gets the \
+                            resource's fields as CRED_<FIELD>, e.g. CRED_USER and CRED_PASSWORD.")]
     Auto {
-        #[arg(value_parser = parse_name)]
-        name: String,
+        #[arg(value_parser = parse_resource)]
+        resource: String,
+        #[arg(value_parser = parse_field)]
+        field: String,
         /// Shell command that prints a fresh value on stdout
         #[arg(long, conflicts_with = "off")]
         cmd: Option<String>,
         #[arg(long)]
         off: bool,
     },
-    /// Refresh auto-refreshing secrets due within the hour (all named ones with --force)
+    /// Refresh auto fields due within the hour (every auto field of the named resources with --force)
     Refresh {
-        names: Vec<String>,
+        #[arg(value_parser = parse_resource)]
+        resources: Vec<String>,
         #[arg(long)]
         force: bool,
     },
-    /// Show NAME's details (never the value)
-    Info { name: String },
-    /// List names, expiry, age, description (never values)
+    /// Show a resource and its fields (never values)
+    Info {
+        #[arg(value_parser = parse_resource)]
+        resource: String,
+    },
+    /// List resources (never values)
     #[command(visible_alias = "list")]
     Ls,
-    /// List expired/expiring secrets; exit 1 if any
+    /// List expired/expiring fields; exit 1 if any
     Check {
         /// Warning window in days [default: $CRED_WARN_DAYS or 14]
         days: Option<i64>,
     },
-    /// Delete a secret
+    /// Delete one field, or the whole resource
     #[command(visible_alias = "delete")]
-    Rm { name: String },
-    /// Copy a value to the clipboard (humans only)
-    Copy { name: String },
-    /// Run CMD with secrets as env vars, values masked in its output
-    #[command(after_help = "Also loads names listed in ./.cred (one per line, # comments ok), \
+    Rm {
+        #[arg(value_parser = parse_resource)]
+        resource: String,
+        #[arg(value_parser = parse_field)]
+        field: Option<String>,
+    },
+    /// Copy a field's value to the clipboard (humans only)
+    Copy {
+        #[arg(value_parser = parse_resource)]
+        resource: String,
+        #[arg(value_parser = parse_field)]
+        field: String,
+    },
+    /// Run CMD with the resources' exported fields as env vars, values masked in its output
+    #[command(after_help = "Also loads resource names listed in ./.cred (one per line, # comments ok), \
                             searching upward from the current directory.")]
     Run {
-        #[arg(short = 's', long = "secret", value_name = "NAME", value_parser = parse_name)]
-        secrets: Vec<String>,
+        #[arg(short = 's', long = "secret", value_name = "RESOURCE", value_parser = parse_resource)]
+        resources: Vec<String>,
         #[arg(last = true, required = true, value_name = "CMD")]
         command: Vec<String>,
     },
 }
 
-fn parse_name(s: &str) -> Result<String, String> {
+fn parse_resource(s: &str) -> Result<String, String> {
+    let mut chars = s.chars();
+    let ok = chars.next().is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if ok { Ok(s.to_string()) } else { Err("use lowercase letters, digits and -, e.g. github".into()) }
+}
+
+fn parse_field(s: &str) -> Result<String, String> {
+    let mut chars = s.chars();
+    let ok = chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if ok { Ok(s.to_string()) } else { Err("use lowercase letters, digits and _, e.g. token".into()) }
+}
+
+fn parse_env(s: &str) -> Result<String, String> {
     let mut chars = s.chars();
     let ok = chars.next().is_some_and(|c| c.is_ascii_uppercase() || c == '_')
         && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
@@ -137,11 +186,20 @@ fn parse_date(s: &str) -> Result<Date, String> {
 // --- index (metadata only, never values) ---
 
 #[derive(Serialize, Deserialize, Default)]
-struct Entry {
+struct Resource {
     #[serde(default)]
     url: String,
-    #[serde(default, alias = "note")]
+    #[serde(default)]
     description: String,
+    #[serde(default)]
+    fields: BTreeMap<String, Field>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct Field {
+    /// Env var `cred run` exports this field as; unmapped fields never leave cred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     updated: Option<Date>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -154,7 +212,7 @@ struct Entry {
     refresh: Option<String>,
 }
 
-impl Entry {
+impl Resource {
     fn apply(&mut self, meta: &Meta) {
         if let Some(u) = &meta.url {
             self.url = u.clone();
@@ -164,6 +222,12 @@ impl Entry {
         }
     }
 
+    fn has_auto(&self) -> bool {
+        self.fields.values().any(|f| f.refresh.is_some())
+    }
+}
+
+impl Field {
     /// Due within the hour of an exact expiry, on the expiry date, or daily when expiry is unknown.
     fn due(&self) -> bool {
         match (self.expires_at, self.expires, self.updated) {
@@ -181,11 +245,21 @@ impl Entry {
             (None, None) => false,
         }
     }
+
+    /// When it expires, comparable across exact and date-only expiries.
+    fn expiry_key(&self) -> Option<Timestamp> {
+        self.expires_at
+            .or_else(|| self.expires?.to_zoned(TimeZone::system()).ok().map(|z| z.timestamp()))
+    }
+
+    fn expiry_text(&self) -> Option<String> {
+        self.expires_at.map(local_time).or_else(|| self.expires.map(|d| d.to_string()))
+    }
 }
 
 struct Index {
     path: PathBuf,
-    map: BTreeMap<String, Entry>,
+    map: BTreeMap<String, Resource>,
 }
 
 impl Index {
@@ -211,6 +285,17 @@ impl Index {
         fs::rename(&tmp, &self.path)?;
         Ok(())
     }
+
+    fn get(&self, res: &str) -> Result<&Resource> {
+        self.map.get(res).with_context(|| format!("{res} doesn't exist (create it with: cred set {res} FIELD)"))
+    }
+
+    fn field_mut(&mut self, res: &str, field: &str) -> Result<&mut Field> {
+        self.map
+            .get_mut(res)
+            .and_then(|r| r.fields.get_mut(field))
+            .with_context(|| format!("{res}/{field} doesn't exist (add it with: cred set {res} {field})"))
+    }
 }
 
 // --- keychain, clipboard, terminal ---
@@ -219,16 +304,24 @@ fn account() -> String {
     env::var("USER").unwrap_or_default()
 }
 
-fn kc_get(name: &str) -> Option<String> {
-    get_generic_password(&format!("{PREFIX}{name}"), &account())
+fn service(res: &str, field: &str) -> String {
+    format!("{PREFIX}{res}/{field}")
+}
+
+fn kc_get(res: &str, field: &str) -> Option<String> {
+    get_generic_password(&service(res, field), &account())
         .ok()
         .map(|v| String::from_utf8_lossy(&v).into_owned())
 }
 
-fn kc_set(name: &str, value: &str) -> Result<()> {
+fn kc_set(res: &str, field: &str, value: &str) -> Result<()> {
     // Updates in place if the item exists, so rotation keeps the same Keychain item.
-    set_generic_password(&format!("{PREFIX}{name}"), &account(), value.as_bytes())
-        .with_context(|| format!("storing {name} in Keychain"))
+    set_generic_password(&service(res, field), &account(), value.as_bytes())
+        .with_context(|| format!("storing {res}/{field} in Keychain"))
+}
+
+fn kc_delete(res: &str, field: &str) -> bool {
+    delete_generic_password(&service(res, field), &account()).is_ok()
 }
 
 fn pbpaste() -> Result<String> {
@@ -254,6 +347,8 @@ fn ask(prompt: &str) -> Result<String> {
     io::stdin().read_line(&mut line)?;
     Ok(line.trim().to_string())
 }
+
+// --- time ---
 
 fn today() -> Date {
     jiff::Zoned::now().date()
@@ -285,7 +380,7 @@ fn warn_days() -> i64 {
     env::var("CRED_WARN_DAYS").ok().and_then(|v| v.parse().ok()).unwrap_or(14)
 }
 
-// --- commands ---
+// --- storing ---
 
 enum Expiry {
     Keep,
@@ -293,27 +388,31 @@ enum Expiry {
     Clear,
 }
 
-/// Store the value and its metadata; returns " (expires …)" for the caller's message.
-fn store(name: &str, value: &str, expiry: Expiry, meta: &Meta) -> Result<String> {
-    kc_set(name, value)?;
+/// Store a field's value and metadata; returns " (expires …)" for the caller's message.
+fn store(res: &str, field: &str, value: &str, expiry: Expiry, env: Option<String>, meta: &Meta) -> Result<String> {
+    kc_set(res, field, value)?;
     let mut idx = Index::load()?;
-    let e = idx.map.entry(name.to_string()).or_default();
-    e.apply(meta);
-    e.updated = Some(today());
+    let r = idx.map.entry(res.to_string()).or_default();
+    r.apply(meta);
+    let f = r.fields.entry(field.to_string()).or_default();
+    if env.is_some() {
+        f.env = env;
+    }
+    f.updated = Some(today());
     // A JWT carries its own expiry; an explicit --expires still wins for the date.
-    e.expires_at = jwt_exp(value);
-    let suffix = match (expiry, e.expires_at) {
+    f.expires_at = jwt_exp(value);
+    let suffix = match (expiry, f.expires_at) {
         (Expiry::Set(d), _) => {
-            e.expires = Some(d);
+            f.expires = Some(d);
             format!(" (expires {d})")
         }
         (_, Some(t)) => {
-            e.expires = Some(local_date(t));
+            f.expires = Some(local_date(t));
             format!(" (expires {})", local_time(t))
         }
         (Expiry::Keep, None) => String::new(),
         (Expiry::Clear, None) => {
-            e.expires = None;
+            f.expires = None;
             String::new()
         }
     };
@@ -321,42 +420,50 @@ fn store(name: &str, value: &str, expiry: Expiry, meta: &Meta) -> Result<String>
     Ok(suffix)
 }
 
-fn cmd_set(name: &str, expires: Option<Date>, mut meta: Meta) -> Result<()> {
+// --- commands ---
+
+fn cmd_set(res: &str, field: &str, mut env: Option<String>, expires: Option<Date>, mut meta: Meta) -> Result<()> {
     if !interactive() {
         bail!("set needs an interactive terminal (value is read with hidden input)");
     }
-    let value = rpassword::prompt_password(format!("Value for {name}: "))?;
+    let value = rpassword::prompt_password(format!("Value for {res}/{field}: "))?;
     if value.is_empty() {
         bail!("empty value, nothing stored");
     }
-    // Ask only for fields that are still empty, so rotating a described secret stays one prompt.
+    // Ask only for what is still missing, so rotating a set-up field stays one prompt.
     let idx = Index::load()?;
-    let current = idx.map.get(name);
-    if meta.url.is_none() && current.is_none_or(|e| e.url.is_empty()) {
-        meta.url = Some(ask("Resource link (Enter to leave empty): ")?);
+    let r = idx.map.get(res);
+    if meta.url.is_none() && r.is_none_or(|r| r.url.is_empty()) {
+        meta.url = Some(ask(&format!("Resource link for {res} (Enter to leave empty): "))?);
     }
-    if meta.desc.is_none() && current.is_none_or(|e| e.description.is_empty()) {
-        meta.desc = Some(ask("Description (Enter to leave empty): ")?);
+    if meta.desc.is_none() && r.is_none_or(|r| r.description.is_empty()) {
+        meta.desc = Some(ask(&format!("Description of {res} (Enter to leave empty): "))?);
     }
-    let suffix = store(name, &value, expires.map_or(Expiry::Keep, Expiry::Set), &meta)?;
-    println!("stored {name}{suffix}");
+    if env.is_none() && r.is_none_or(|r| !r.fields.contains_key(field)) {
+        let var = ask(&format!("Export {res}/{field} to `cred run` as env var (Enter keeps it inside cred): "))?;
+        if !var.is_empty() {
+            env = Some(parse_env(&var).map_err(|e| anyhow::anyhow!("env var {e}"))?);
+        }
+    }
+    let suffix = store(res, field, &value, expires.map_or(Expiry::Keep, Expiry::Set), env, &meta)?;
+    println!("stored {res}/{field}{suffix}");
     Ok(())
 }
 
-fn cmd_update(name: &str, expires: Option<Date>, meta: Meta) -> Result<()> {
-    let Some(current) = kc_get(name) else {
-        bail!("{name} is not stored yet (add it with: cred set {name})");
+fn cmd_update(res: &str, field: &str, expires: Option<Date>) -> Result<()> {
+    let Some(current) = kc_get(res, field) else {
+        bail!("{res}/{field} is not stored yet (add it with: cred set {res} {field})");
     };
     // Strip surrounding whitespace and newlines that come along when copying from a web page.
     let value = pbpaste()?.trim().to_string();
     if value.is_empty() {
-        bail!("clipboard is empty — copy the new token first");
+        bail!("clipboard is empty — copy the new value first");
     }
     if value.contains(char::is_whitespace) {
         bail!("clipboard contains whitespace inside the value — copy just the token");
     }
     if value == current {
-        bail!("clipboard matches the stored {name} — copy the new token first");
+        bail!("clipboard matches the stored {res}/{field} — copy the new value first");
     }
 
     // A rotated token has a new expiry; the old date would be wrong, so ask instead of keeping it.
@@ -366,11 +473,13 @@ fn cmd_update(name: &str, expires: Option<Date>, meta: Meta) -> Result<()> {
         None if interactive() => {
             let old = Index::load()?
                 .map
-                .get(name)
-                .and_then(|e| e.expires)
+                .get(res)
+                .and_then(|r| r.fields.get(field))
+                .and_then(|f| f.expires)
                 .map_or("none".to_string(), |d| d.to_string());
-            let answer =
-                ask(&format!("New expiry for {name}, YYYY-MM-DD (was {old}; blank = no expiry): "))?;
+            let answer = ask(&format!(
+                "New expiry for {res}/{field}, YYYY-MM-DD (was {old}; blank = no expiry): "
+            ))?;
             if answer.is_empty() {
                 Expiry::Clear
             } else {
@@ -380,19 +489,30 @@ fn cmd_update(name: &str, expires: Option<Date>, meta: Meta) -> Result<()> {
         None => Expiry::Clear,
     };
 
-    let suffix = store(name, &value, expiry, &meta)?;
-    println!("stored {name}{suffix}");
+    let suffix = store(res, field, &value, expiry, None, &Meta::default())?;
+    println!("stored {res}/{field}{suffix}");
     pbcopy("")?;
     println!("clipboard cleared");
     Ok(())
 }
 
-fn cmd_describe(name: &str, mut meta: Meta) -> Result<()> {
-    if kc_get(name).is_none() {
-        bail!("{name} is not stored (add it with: cred set {name})");
-    }
+fn cmd_env(res: &str, field: &str, var: Option<String>) -> Result<()> {
     let mut idx = Index::load()?;
-    let e = idx.map.entry(name.to_string()).or_default();
+    let f = idx.field_mut(res, field)?;
+    f.env = var;
+    let msg = match &f.env {
+        Some(v) => format!("cred run exports {res}/{field} as {v}"),
+        None => format!("{res}/{field} stays inside cred"),
+    };
+    idx.save()?;
+    println!("{msg}");
+    Ok(())
+}
+
+fn cmd_describe(res: &str, mut meta: Meta) -> Result<()> {
+    let mut idx = Index::load()?;
+    idx.get(res)?;
+    let r = idx.map.get_mut(res).expect("checked above");
     if meta.url.is_none() && meta.desc.is_none() {
         if !interactive() {
             bail!("give --url and/or --desc, or run in a terminal to be prompted");
@@ -405,146 +525,180 @@ fn cmd_describe(name: &str, mut meta: Meta) -> Result<()> {
         };
         let shown = |s: &str| if s.is_empty() { "empty".to_string() } else { s.to_string() };
         eprintln!("Enter keeps the current value, a single - clears it.");
-        meta.url = keep_or_clear(ask(&format!("Resource link [{}]: ", shown(&e.url)))?);
-        meta.desc = keep_or_clear(ask(&format!("Description [{}]: ", shown(&e.description)))?);
+        meta.url = keep_or_clear(ask(&format!("Resource link [{}]: ", shown(&r.url)))?);
+        meta.desc = keep_or_clear(ask(&format!("Description [{}]: ", shown(&r.description)))?);
     }
-    e.apply(&meta);
+    r.apply(&meta);
     idx.save()?;
-    println!("updated {name}");
+    println!("updated {res}");
     Ok(())
 }
 
-fn cmd_auto(name: &str, cmd: Option<String>, off: bool) -> Result<()> {
+fn cmd_auto(res: &str, field: &str, cmd: Option<String>, off: bool) -> Result<()> {
     let mut idx = Index::load()?;
     if cmd.is_none() && !off {
-        match idx.map.get(name).and_then(|e| e.refresh.as_deref()) {
-            Some(c) => println!("{name} refreshes with: {c}"),
-            None => println!("{name} has no auto-refresh"),
+        let current = idx.map.get(res).and_then(|r| r.fields.get(field)).and_then(|f| f.refresh.as_deref());
+        match current {
+            Some(c) => println!("{res}/{field} refreshes with: {c}"),
+            None => println!("{res}/{field} has no auto-refresh"),
         }
         return Ok(());
     }
-    let e = idx.map.entry(name.to_string()).or_default();
-    e.refresh = cmd;
+    // Auto-refresh may be set up before the first value exists; the first refresh creates it.
+    let f = idx.map.entry(res.to_string()).or_default().fields.entry(field.to_string()).or_default();
+    f.refresh = cmd;
     // Learn the exact expiry of a value stored before, so the first refresh happens on time.
-    if e.refresh.is_some()
-        && e.expires_at.is_none()
-        && let Some(t) = kc_get(name).as_deref().and_then(jwt_exp)
+    if f.refresh.is_some()
+        && f.expires_at.is_none()
+        && let Some(t) = kc_get(res, field).as_deref().and_then(jwt_exp)
     {
-        e.expires_at = Some(t);
-        e.expires = Some(local_date(t));
+        f.expires_at = Some(t);
+        f.expires = Some(local_date(t));
     }
-    let on = e.refresh.is_some();
+    let on = f.refresh.is_some();
     idx.save()?;
-    println!("auto-refresh {} for {name}", if on { "on" } else { "off" });
+    println!("auto-refresh {} for {res}/{field}", if on { "on" } else { "off" });
     Ok(())
 }
 
-/// Run NAME's refresh command and store what it prints. Messages go to stderr,
-/// so a refresh inside `cred run` never mixes into the command's output.
-fn refresh_one(name: &str, cmd: &str) -> Result<()> {
-    let out = Command::new("sh")
+/// Run a field's refresh command and store what it prints. The resource's fields are passed
+/// as CRED_<FIELD>. Messages go to stderr, so a refresh inside `cred run` never mixes into
+/// the command's output.
+fn refresh_one(res: &str, r: &Resource, field: &str, cmd: &str) -> Result<()> {
+    let mut command = Command::new("sh");
+    for name in r.fields.keys() {
+        if let Some(v) = kc_get(res, name) {
+            command.env(format!("CRED_{}", name.to_uppercase()), v);
+        }
+    }
+    let out = command
         .args(["-c", cmd])
-        .env(REFRESHING, name)
+        .env(REFRESHING, res)
         .stdin(Stdio::null())
         .stderr(Stdio::inherit())
         .output()
-        .with_context(|| format!("running refresh command for {name}"))?;
+        .with_context(|| format!("running refresh command for {res}/{field}"))?;
     if !out.status.success() {
-        bail!("refresh command for {name} failed ({})", out.status);
+        bail!("refresh command for {res}/{field} failed ({})", out.status);
     }
     let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if value.is_empty() || value.contains(char::is_whitespace) {
-        bail!("refresh command for {name} must print exactly one value");
+        bail!("refresh command for {res}/{field} must print exactly one value");
     }
-    let suffix = store(name, &value, Expiry::Keep, &Meta::default())?;
-    eprintln!("cred: refreshed {name}{suffix}");
+    let suffix = store(res, field, &value, Expiry::Keep, None, &Meta::default())?;
+    eprintln!("cred: refreshed {res}/{field}{suffix}");
     Ok(())
 }
 
-/// Refresh each auto-refreshing NAME that is due (or all with force). Returns false if any failed.
-fn refresh_due(names: &[String], force: bool, verbose: bool) -> bool {
+/// Refresh each auto field of the given resources that is due (or all with force).
+/// Returns false if any refresh failed.
+fn refresh_due(resources: &[String], force: bool, verbose: bool) -> bool {
     if env::var_os(REFRESHING).is_some() {
         return true;
     }
     let Ok(idx) = Index::load() else { return false };
     let mut ok = true;
-    for name in names {
-        let Some(e) = idx.map.get(name) else { continue };
-        let Some(cmd) = &e.refresh else { continue };
-        if force || e.due() {
-            if let Err(err) = refresh_one(name, cmd) {
-                eprintln!("cred: {err:#}");
-                ok = false;
+    for res in resources {
+        let Some(r) = idx.map.get(res) else { continue };
+        for (field, f) in &r.fields {
+            let Some(cmd) = &f.refresh else { continue };
+            if force || f.due() {
+                if let Err(err) = refresh_one(res, r, field, cmd) {
+                    eprintln!("cred: {err:#}");
+                    ok = false;
+                }
+            } else if verbose {
+                let until = f.expiry_text().map_or(String::new(), |t| format!(" (expires {t})"));
+                eprintln!("cred: {res}/{field} is fresh{until}");
             }
-        } else if verbose {
-            let until = e.expires_at.map_or(String::new(), |t| format!(" (expires {})", local_time(t)));
-            eprintln!("cred: {name} is fresh{until}");
         }
     }
     ok
 }
 
-fn auto_names(idx: &Index) -> Vec<String> {
-    idx.map.iter().filter(|(_, e)| e.refresh.is_some()).map(|(n, _)| n.clone()).collect()
+fn auto_resources(idx: &Index) -> Vec<String> {
+    idx.map.iter().filter(|(_, r)| r.has_auto()).map(|(n, _)| n.clone()).collect()
 }
 
-fn cmd_refresh(names: Vec<String>, force: bool) -> Result<u8> {
+fn cmd_refresh(resources: Vec<String>, force: bool) -> Result<u8> {
     let idx = Index::load()?;
-    let names = if names.is_empty() { auto_names(&idx) } else { names };
-    if names.is_empty() {
-        println!("no secrets have auto-refresh (set one with: cred auto NAME --cmd ...)");
+    let resources = if resources.is_empty() { auto_resources(&idx) } else { resources };
+    if resources.is_empty() {
+        println!("nothing has auto-refresh (set it with: cred auto RESOURCE FIELD --cmd ...)");
         return Ok(0);
     }
-    for n in &names {
-        if idx.map.get(n).is_none_or(|e| e.refresh.is_none()) {
-            bail!("{n} has no auto-refresh (set one with: cred auto {n} --cmd ...)");
+    for res in &resources {
+        if !idx.get(res)?.has_auto() {
+            bail!("{res} has no auto-refresh field (set one with: cred auto {res} FIELD --cmd ...)");
         }
     }
-    Ok(if refresh_due(&names, force, true) { 0 } else { 1 })
+    Ok(if refresh_due(&resources, force, true) { 0 } else { 1 })
 }
 
-fn cmd_info(name: &str) -> Result<()> {
+fn cmd_info(res: &str) -> Result<()> {
     let idx = Index::load()?;
-    let Some(e) = idx.map.get(name) else { bail!("{name} is not in the index") };
-    let opt = |d: Option<Date>| d.map(|d| d.to_string()).unwrap_or_default();
-    let in_kc = if kc_get(name).is_some() { "yes" } else { "MISSING" };
-    for (k, v) in [
-        ("name", name.to_string()),
-        ("in-keychain", in_kc.to_string()),
-        ("expires", opt(e.expires)),
-        ("expires-at", e.expires_at.map(local_time).unwrap_or_default()),
-        ("updated", opt(e.updated)),
-        ("refresh", e.refresh.clone().unwrap_or_default()),
-        ("url", e.url.clone()),
-        ("description", e.description.clone()),
-    ] {
-        println!("{k:<12} {v}");
+    let r = idx.get(res)?;
+    println!("{:<12} {res}", "name");
+    println!("{:<12} {}", "url", r.url);
+    println!("{:<12} {}", "description", r.description);
+    for (name, f) in &r.fields {
+        let mut parts = vec![if kc_get(res, name).is_some() { "stored" } else { "MISSING" }.to_string()];
+        parts.push(f.env.as_ref().map_or("inside cred".to_string(), |v| format!("exported as {v}")));
+        if let Some(t) = f.expiry_text() {
+            parts.push(format!("expires {t}"));
+        }
+        if let Some(u) = f.updated {
+            parts.push(format!("updated {u}"));
+        }
+        println!("{name:<12} {}", parts.join(", "));
+        if let Some(cmd) = &f.refresh {
+            println!("{:<12}   auto-refresh: {cmd}", "");
+        }
     }
     Ok(())
+}
+
+/// A field's status label and how urgent it is (higher = worse), for picking a resource's status.
+fn field_status(res: &str, name: &str, f: &Field, warn: i64) -> (i64, String) {
+    if kc_get(res, name).is_none() {
+        return (i64::MAX, "MISSING".into());
+    }
+    if f.expired() {
+        return (i64::MAX - 1, "EXPIRED".into());
+    }
+    if f.refresh.is_some() {
+        return (1, "auto".into());
+    }
+    match f.expires.map(days_left) {
+        // Fewer days left is more urgent.
+        Some(d) if d <= warn => (1000 - d, format!("{d}d left")),
+        _ => (0, "ok".into()),
+    }
 }
 
 fn cmd_ls() -> Result<()> {
     let idx = Index::load()?;
     let warn = warn_days();
-    println!("{:<32} {:<12} {:<10} {:<11} DESCRIPTION", "NAME", "EXPIRES", "STATUS", "UPDATED");
-    for (name, e) in &idx.map {
-        let mut status = match e.expires.map(days_left) {
-            _ if e.expired() => "EXPIRED".to_string(),
-            _ if e.refresh.is_some() => "auto".to_string(),
-            Some(d) if d < 0 => "EXPIRED".to_string(),
-            Some(d) if d <= warn => format!("{d}d left"),
-            _ => "ok".to_string(),
-        };
-        if kc_get(name).is_none() {
-            status = "MISSING".into();
-        }
-        let dash = |d: Option<Date>| d.map_or("-".to_string(), |d| d.to_string());
-        println!(
-            "{name:<32} {:<12} {status:<10} {:<11} {}",
-            dash(e.expires),
-            dash(e.updated),
-            e.description
-        );
+    println!("{:<20} {:<9} {:<17} {:<34} DESCRIPTION", "RESOURCE", "STATUS", "EXPIRES", "FIELDS");
+    for (res, r) in &idx.map {
+        let status = r
+            .fields
+            .iter()
+            .map(|(n, f)| field_status(res, n, f, warn))
+            .max_by_key(|(rank, _)| *rank)
+            .map_or("empty".to_string(), |(_, s)| s);
+        let expires = r
+            .fields
+            .values()
+            .filter_map(|f| Some((f.expiry_key()?, f.expiry_text()?)))
+            .min_by_key(|(key, _)| *key)
+            .map_or("-".to_string(), |(_, text)| text);
+        let fields: Vec<String> = r
+            .fields
+            .iter()
+            .map(|(n, f)| f.env.as_ref().map_or(n.clone(), |v| format!("{n}→{v}")))
+            .collect();
+        println!("{res:<20} {status:<9} {expires:<17} {:<34} {}", fields.join(", "), r.description);
     }
     Ok(())
 }
@@ -552,45 +706,62 @@ fn cmd_ls() -> Result<()> {
 fn cmd_check(days: Option<i64>) -> Result<u8> {
     let within = days.unwrap_or_else(warn_days);
     // Renew what can renew itself first; those are only reported if still expired afterwards.
-    refresh_due(&auto_names(&Index::load()?), false, false);
+    refresh_due(&auto_resources(&Index::load()?), false, false);
     let mut bad = 0;
-    for (name, e) in &Index::load()?.map {
-        let Some(exp) = e.expires else { continue };
-        let d = days_left(exp);
-        let msg = if e.refresh.is_some() {
-            if !e.expired() {
+    for (res, r) in &Index::load()?.map {
+        for (name, f) in &r.fields {
+            let Some(exp) = f.expires else { continue };
+            let d = days_left(exp);
+            let msg = if f.refresh.is_some() {
+                if !f.expired() {
+                    continue;
+                }
+                format!("{res}/{name} expired and auto-refresh failed (cred refresh {res})")
+            } else if d < 0 {
+                format!("{res}/{name} expired {}d ago ({exp})", -d)
+            } else if d <= within {
+                format!("{res}/{name} expires in {d}d ({exp})")
+            } else {
                 continue;
-            }
-            format!("{name} expired and auto-refresh failed (cred refresh {name})")
-        } else if d < 0 {
-            format!("{name} expired {}d ago ({exp})", -d)
-        } else if d <= within {
-            format!("{name} expires in {d}d ({exp})")
-        } else {
-            continue;
-        };
-        let rotate = if e.url.is_empty() { String::new() } else { format!(" — rotate at {}", e.url) };
-        println!("{msg}{rotate}");
-        bad = 1;
+            };
+            let rotate = if r.url.is_empty() { String::new() } else { format!(" — rotate at {}", r.url) };
+            println!("{msg}{rotate}");
+            bad = 1;
+        }
     }
     Ok(bad)
 }
 
-fn cmd_rm(name: &str) -> Result<()> {
-    if delete_generic_password(&format!("{PREFIX}{name}"), &account()).is_err() {
-        eprintln!("cred: {name} not in Keychain");
-    }
+fn cmd_rm(res: &str, field: Option<String>) -> Result<()> {
     let mut idx = Index::load()?;
-    idx.map.remove(name);
-    idx.save()?;
-    println!("removed {name}");
-    Ok(())
+    let names: Vec<String> = match &field {
+        Some(f) => vec![f.clone()],
+        None => idx.get(res)?.fields.keys().cloned().collect(),
+    };
+    for name in &names {
+        if !kc_delete(res, name) {
+            eprintln!("cred: {res}/{name} not in Keychain");
+        }
+    }
+    match field {
+        Some(f) => {
+            if let Some(r) = idx.map.get_mut(res) {
+                r.fields.remove(&f);
+            }
+            println!("removed {res}/{f}");
+        }
+        None => {
+            idx.map.remove(res);
+            println!("removed {res}");
+        }
+    }
+    idx.save()
 }
 
-fn cmd_copy(name: &str) -> Result<()> {
-    let Some(v) = kc_get(name) else { bail!("{name} not found") };
+fn cmd_copy(res: &str, field: &str) -> Result<()> {
+    let Some(v) = kc_get(res, field) else { bail!("{res}/{field} not found") };
     pbcopy(v.trim_end_matches('\n'))?;
-    println!("copied {name} to clipboard");
+    println!("copied {res}/{field} to clipboard");
     Ok(())
 }
 
@@ -624,29 +795,40 @@ fn pump(src: impl Read, mut dst: impl Write, ac: &AhoCorasick) {
     }
 }
 
-fn cmd_run(mut names: Vec<String>, command: Vec<String>) -> Result<u8> {
+fn cmd_run(mut resources: Vec<String>, command: Vec<String>) -> Result<u8> {
     if let Some(f) = find_credfile() {
         for line in fs::read_to_string(&f)?.lines() {
             let n: String = line.split('#').next().unwrap_or("").split_whitespace().collect();
             if !n.is_empty() {
-                names.push(parse_name(&n).map_err(|e| anyhow::anyhow!("{}: '{n}': {e}", f.display()))?);
+                resources.push(parse_resource(&n).map_err(|e| anyhow::anyhow!("{}: '{n}': {e}", f.display()))?);
             }
         }
     }
-    if names.is_empty() {
-        bail!("no secrets requested (use -s NAME or a .cred file)");
+    if resources.is_empty() {
+        bail!("no resources requested (use -s RESOURCE or a .cred file)");
     }
     // A failed refresh is reported; the stored value is still tried.
-    refresh_due(&names, false, false);
+    refresh_due(&resources, false, false);
 
+    let idx = Index::load()?;
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..]).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut masks = Vec::new();
-    for n in &names {
-        let Some(v) = kc_get(n) else { bail!("{n} not found in Keychain (add it with: cred set {n})") };
-        cmd.env(n, &v);
-        if !v.is_empty() {
-            masks.push(v);
+    for res in &resources {
+        let r = idx.get(res)?;
+        let exported: Vec<(&String, &String)> =
+            r.fields.iter().filter_map(|(n, f)| f.env.as_ref().map(|v| (n, v))).collect();
+        if exported.is_empty() {
+            bail!("{res} exports no fields (map one with: cred env {res} FIELD VAR)");
+        }
+        for (name, var) in exported {
+            let Some(v) = kc_get(res, name) else {
+                bail!("{res}/{name} not found in Keychain (add it with: cred set {res} {name})")
+            };
+            cmd.env(var, &v);
+            if !v.is_empty() {
+                masks.push(v);
+            }
         }
     }
     let ac = Arc::new(AhoCorasick::builder().match_kind(MatchKind::LeftmostLongest).build(&masks)?);
@@ -672,17 +854,18 @@ fn cmd_run(mut names: Vec<String>, command: Vec<String>) -> Result<u8> {
 fn main() -> ExitCode {
     let ok = |r: Result<()>| r.map(|_| 0);
     let result = match Cli::parse().cmd {
-        Cmd::Set { name, expires, meta } => ok(cmd_set(&name, expires, meta)),
-        Cmd::Update { name, expires, meta } => ok(cmd_update(&name, expires, meta)),
-        Cmd::Describe { name, meta } => ok(cmd_describe(&name, meta)),
-        Cmd::Auto { name, cmd, off } => ok(cmd_auto(&name, cmd, off)),
-        Cmd::Refresh { names, force } => cmd_refresh(names, force),
-        Cmd::Info { name } => ok(cmd_info(&name)),
+        Cmd::Set { resource, field, env, expires, meta } => ok(cmd_set(&resource, &field, env, expires, meta)),
+        Cmd::Update { resource, field, expires } => ok(cmd_update(&resource, &field, expires)),
+        Cmd::Env { resource, field, var, off: _ } => ok(cmd_env(&resource, &field, var)),
+        Cmd::Describe { resource, meta } => ok(cmd_describe(&resource, meta)),
+        Cmd::Auto { resource, field, cmd, off } => ok(cmd_auto(&resource, &field, cmd, off)),
+        Cmd::Refresh { resources, force } => cmd_refresh(resources, force),
+        Cmd::Info { resource } => ok(cmd_info(&resource)),
         Cmd::Ls => ok(cmd_ls()),
         Cmd::Check { days } => cmd_check(days),
-        Cmd::Rm { name } => ok(cmd_rm(&name)),
-        Cmd::Copy { name } => ok(cmd_copy(&name)),
-        Cmd::Run { secrets, command } => cmd_run(secrets, command),
+        Cmd::Rm { resource, field } => ok(cmd_rm(&resource, field)),
+        Cmd::Copy { resource, field } => ok(cmd_copy(&resource, &field)),
+        Cmd::Run { resources, command } => cmd_run(resources, command),
     };
     match result {
         Ok(code) => ExitCode::from(code),

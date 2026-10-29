@@ -2,6 +2,8 @@
 
 Keychain-backed secrets for humans and agents on macOS. Values live only in the login Keychain; `cred run` injects them into a command as env vars and masks them in its output, so an agent can use a token without ever seeing it.
 
+Secrets are grouped by **resource** — one thing you sign in to (`github`, `aws`, `app`). A resource has a link, a description and **fields** (`token`, `user`, `password`, …), each its own Keychain item. Only fields mapped to an env var are exported by `cred run`; the rest stay inside cred and are handed only to the resource's refresh command.
+
 ## Install
 
 Requires macOS and Rust (`mise use -g rust@stable`, or rustup).
@@ -15,33 +17,36 @@ cred --help
 
 To update: `git pull && cargo install --path . --root ~/.local --force`.
 
-The first time a new build reads a secret it didn't store itself, macOS asks for Keychain access — choose **Always Allow**. A rebuilt binary counts as new, so expect this once per secret after each update.
+The first time a new build reads a secret it didn't store itself, macOS asks for Keychain access — choose **Always Allow**.
 
 ## Use
 
 ```sh
-cred set GITHUB_TOKEN --expires 2027-01-31   # hidden prompt, then optional link + description
-cred update GITHUB_TOKEN                     # rotate: copy the new token, run this
-cred ls                                      # names, expiry, status — never values
+cred set github token --env GITHUB_TOKEN --expires 2027-01-31   # hidden prompt; asks for link/description
+cred update github token                     # rotate: copy the new token, run this
+cred ls                                      # one row per resource — never values
+cred info github                             # fields, export names, expiry, refresh
 cred check                                   # expired / expiring within 14 days
-cred run -s GITHUB_TOKEN -- gh api user      # run with the secret injected and masked
+cred run -s github -- gh api user            # exported fields injected, values masked
 ```
+
+`cred env RES FIELD VAR` changes what a field is exported as (`--off` keeps it inside cred), `cred describe RES` edits the link/description, `cred rm RES [FIELD]` deletes. Put resource names (one per line) in a `.cred` file in a repo and `cred run -- CMD` loads them. `cred --help` lists everything.
 
 ### Auto-refresh
 
-For short-lived tokens, give `cred` a command that prints a fresh value:
+For short-lived tokens, store the login as fields and give cred a command that prints a fresh value. The command gets the resource's fields as `CRED_<FIELD>`:
 
 ```sh
-cred auto APP_TOKEN --cmd 'cred run -s APP_EMAIL -s APP_PASSWORD -- ~/.config/cred/refresh/app.sh'
-cred auto APP_TOKEN --off                    # stop
-cred refresh [NAME] [--force]                # refresh now if due
+cred set app user
+cred set app password
+cred auto app token --cmd ~/.config/cred/refresh/app.sh   # script uses $CRED_USER / $CRED_PASSWORD
+cred env app token APP_TOKEN
+cred refresh app --force                     # refresh now (without --force: only if due)
 ```
 
-A secret is refreshed when it's within an hour of expiring, or daily if its expiry is unknown. This happens automatically right before `cred run` uses it, and during `cred check`. JWT values have their exact expiry read from the token.
+A field is refreshed within an hour of expiring (daily if its expiry is unknown) — automatically right before `cred run` uses it and during `cred check`. JWT values get their exact expiry from the token.
 
-Put names (one per line) in a `.cred` file in a repo and `cred run -- CMD` loads them. `cred --help` and `cred <command> --help` list everything.
-
-Metadata (expiry, link, description — never values) is kept in `~/.config/cred/index.json`; override with `CRED_INDEX`. `CRED_WARN_DAYS` sets the warning window.
+Metadata (never values) is kept in `~/.config/cred/index.json`; override with `CRED_INDEX`. `CRED_WARN_DAYS` sets the warning window.
 
 ## With Claude Code
 
