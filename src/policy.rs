@@ -7,6 +7,7 @@
 //! program), blocks the resource until it is approved again.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::process::Command;
 use std::{env, fs};
@@ -15,10 +16,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use similar::TextDiff;
 use url::{Host, Url};
 
 use crate::util::{config_dir, expand_home, sha256_hex};
-use crate::{approve, browser, keychain, parse_env, parse_field, parse_resource};
+use crate::{approve, ask, browser, interactive, keychain, parse_env, parse_field, parse_resource};
 
 /// Keychain field of a resource's approval record. Field names can't start with "_".
 const APPROVAL: &str = "_policy";
@@ -459,6 +461,9 @@ struct Approval {
     policy: String,
     /// refresh script path -> sha256
     scripts: BTreeMap<String, String>,
+    /// The approved text itself, so a later edit can be shown as a diff. Absent in older records.
+    #[serde(default)]
+    text: Option<String>,
 }
 
 /// A policy that is approved and unchanged since.
@@ -543,6 +548,11 @@ impl Approved {
     }
 }
 
+/// The policy text as it was approved, if the approval record keeps it.
+fn approved_text(res: &str) -> Option<String> {
+    record(res)?.text
+}
+
 /// Forget a resource's approval; its policy has no effect until approved again.
 pub fn revoke(res: &str) {
     keychain::delete(res, APPROVAL);
@@ -567,7 +577,7 @@ fn prepare(res: &str) -> Result<Approval> {
         println!("pins {script} (sha256 {})", &hash[..12]);
     }
     println!("sha256 {}\n", &digest[..12]);
-    Ok(Approval { policy: digest, scripts })
+    Ok(Approval { policy: digest, scripts, text: Some(text) })
 }
 
 /// Approve the given resources' policies with one confirmation (all policies when none given).
@@ -598,6 +608,26 @@ pub fn show(res: &str) -> Result<()> {
     Ok(())
 }
 
+/// What changed from the approved text to the current one, as a unified diff. Colored
+/// (ANSI) for a terminal.
+fn diff(old: &str, new: &str, color: bool) -> String {
+    let body = TextDiff::from_lines(old, new).unified_diff().context_radius(3).to_string();
+    let paint = |code: &str, line: &str| if color { format!("\x1b[{code}m{line}\x1b[0m\n") } else { format!("{line}\n") };
+    let mut out = paint("1", "--- approved") + &paint("1", "+++ now");
+    for line in body.lines() {
+        out += &paint(
+            match line.as_bytes().first() {
+                Some(b'+') => "32",
+                Some(b'-') => "31",
+                Some(b'@') => "36",
+                _ => "0",
+            },
+            line,
+        );
+    }
+    out
+}
+
 pub fn edit(res: &str) -> Result<()> {
     let p = path(res);
     if !p.exists() {
@@ -609,8 +639,20 @@ pub fn edit(res: &str) -> Result<()> {
     if !status.success() {
         bail!("{editor} exited with {status}");
     }
-    Policy::parse(&fs::read_to_string(&p)?).with_context(|| p.display().to_string())?;
+    let text = fs::read_to_string(&p)?;
+    Policy::parse(&text).with_context(|| p.display().to_string())?;
+    // A policy approved before shows what the edit changes; a new one is shown whole when approved.
+    if let Some(old) = approved_text(res) {
+        if old == text {
+            println!("no change from the approved policy for {res}");
+            return Ok(());
+        }
+        println!("{}", diff(&old, &text, io::stdout().is_terminal()));
+    }
     println!("saved {} — it takes effect once approved: cred policy approve {res}", p.display());
+    if interactive() && ask("Approve it now? [y/N] ")?.eq_ignore_ascii_case("y") {
+        approve(&[res.to_string()])?;
+    }
     Ok(())
 }
 
@@ -724,6 +766,16 @@ mod tests {
         assert!(dom.covers_cookie("example.com") && dom.covers_cookie("app.example.com") && !dom.covers_cookie("other.com"));
         let p = Policy::parse("[browse]\norigins = [\"https://*.example.com\"]\nrequests = [\"*\"]\nstart = \"https://app.example.com/\"\nscreenshots = true\ncookies = [{ name = \"s\", field = \"token\", domain = \".example.com\" }]").unwrap();
         assert_eq!(p.browse.unwrap().requests(), ["*"]);
+    }
+
+    #[test]
+    fn diffs_against_the_approved_text() {
+        let old = "[run]\nmode = \"ask\"\n";
+        let new = "[run]\nmode = \"allow\"\n";
+        let plain = diff(old, new, false);
+        assert_eq!(plain, "--- approved\n+++ now\n@@ -1,2 +1,2 @@\n [run]\n-mode = \"ask\"\n+mode = \"allow\"\n");
+        let colored = diff(old, new, true);
+        assert!(colored.contains("\x1b[31m-mode = \"ask\"\x1b[0m\n") && colored.contains("\x1b[32m+mode = \"allow\"\x1b[0m\n"));
     }
 
     #[test]
