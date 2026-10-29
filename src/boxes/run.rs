@@ -114,6 +114,8 @@ pub struct Request<'a> {
     /// What names the VM, socket, lock and mount: the box's name, or a unique one for `--temp`.
     pub id: String,
     pub policy: &'a BoxPolicy,
+    /// The SHA-256 of the approved policy text: a join must run under the policy the box opened with.
+    pub policy_sha: String,
     /// A kept box, whose store and key last; otherwise a store made for this run and shredded after.
     pub persistent: bool,
     /// The id belongs to this run alone, so its lock file goes with it.
@@ -148,8 +150,18 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
         if !world.running(&vm) {
             bail!("box {} is being opened or closed by another cred: try again in a moment", req.name);
         }
+        // The door of the open box keeps the rules it started with, so joining under a policy
+        // approved since would promise rules nothing enforces.
+        if fs::read_to_string(layout.opened_with(&req.id)).ok().as_deref() != Some(req.policy_sha.as_str()) {
+            bail!(
+                "box {} runs with the policy it was opened with, not the one approved since: stop it (cred box stop {}) and run it again",
+                req.name,
+                req.name
+            );
+        }
         return exit_code(world.exec(&vm, &agent_env()?, &command, req.tty)?);
     };
+    fs::write(layout.opened_with(&req.id), &req.policy_sha).with_context(|| format!("noting the policy box {} opens with", req.name))?;
 
     // Holding the lock, whatever a crashed run left is ours to clear.
     sweep_temp(layout)?;
@@ -593,7 +605,7 @@ mod tests {
     }
 
     fn request<'a>(s: &'a Setup, policy: &'a BoxPolicy, persistent: bool) -> Request<'a> {
-        Request { name: "r", id: "r".into(), policy, persistent, unique: false, command: None, tty: false, stop: &s.stop }
+        Request { name: "r", id: "r".into(), policy, policy_sha: "sha-1".into(), persistent, unique: false, command: None, tty: false, stop: &s.stop }
     }
 
     fn policy(s: &Setup, extra: &str) -> BoxPolicy {
@@ -718,12 +730,19 @@ mod tests {
         let p = policy(&s, "");
         s.layout.prepare().unwrap();
         let held = store::lock(&s.layout.lock("r")).unwrap().unwrap();
+        fs::write(s.layout.opened_with("r"), "sha-1").unwrap();
 
         let fake = Fake { running: Mutex::new(true), ..Fake::default() };
         let code = run(&s.layout, &fake, &Request { command: Some(vec!["bash".into()]), ..request(&s, &p, false) }).unwrap();
         assert_eq!(code, 0);
         assert_eq!(fake.calls(), ["bearer: anthropic", "exec"], "no second store, VM or door");
         assert!(!store::is_mounted(&s.layout.mount_point("r")));
+
+        // Approved again since the box opened: joining would run under rules the door doesn't know.
+        let changed = Fake { running: Mutex::new(true), ..Fake::default() };
+        let e = run(&s.layout, &changed, &Request { policy_sha: "sha-2".into(), ..request(&s, &p, false) }).unwrap_err().to_string();
+        assert!(e.contains("cred box stop r"), "{e}");
+        assert!(changed.calls().is_empty(), "nothing runs: {:?}", changed.calls());
 
         let starting = Fake::default();
         let e = run(&s.layout, &starting, &request(&s, &p, false)).unwrap_err().to_string();

@@ -56,6 +56,9 @@ pub fn agent_env(oauth: bool) -> Vec<(String, String)> {
         ("http_proxy", proxy),
         ("NO_PROXY", NO_PROXY),
         ("no_proxy", NO_PROXY),
+        // Node's built-in fetch ignores the proxy variables without this (it warns that it's
+        // experimental once per process).
+        ("NODE_USE_ENV_PROXY", "1"),
         ("ANTHROPIC_BASE_URL", "http://127.0.0.2/model"),
         (key, STANDIN),
         ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),

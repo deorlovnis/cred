@@ -311,11 +311,12 @@ writes = "deny"                         # anything but a read (GET, HEAD, OPTION
 
 // --- approval ---
 
-/// The approved policy of a box, or why there is none.
-pub fn load(name: &str) -> Result<BoxPolicy> {
+/// The approved policy of a box and its text, or why there is none.
+fn load(name: &str) -> Result<(BoxPolicy, String)> {
     let p = path(name);
     let text = policy::approved_at(&key(name), &p).map_err(|why| not_approved(name, &why))?;
-    BoxPolicy::parse(&text).with_context(|| p.display().to_string())
+    let policy = BoxPolicy::parse(&text).with_context(|| p.display().to_string())?;
+    Ok((policy, text))
 }
 
 fn not_approved(name: &str, why: &Status) -> anyhow::Error {
@@ -425,7 +426,7 @@ pub fn edit(name: &str) -> Result<()> {
 
 /// `cred box run`: open the box (or join it if it runs), and work in it until it ends.
 pub fn run(name: &str, temp: bool, command: Vec<String>) -> Result<u8> {
-    let policy = load(name)?;
+    let (policy, text) = load(name)?;
     let layout = Layout::real()?;
     let persistent = policy.keep && !temp;
     if persistent && !layout.bundle(name).exists() {
@@ -440,6 +441,7 @@ pub fn run(name: &str, temp: bool, command: Vec<String>) -> Result<u8> {
         name,
         id,
         policy: &policy,
+        policy_sha: crate::util::sha256_hex(text.as_bytes()),
         persistent,
         unique: temp,
         command: (!command.is_empty()).then_some(command),

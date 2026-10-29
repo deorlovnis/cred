@@ -77,6 +77,11 @@ impl Layout {
         self.open_dir().join(format!("{id}.lock"))
     }
 
+    /// The hash of the approved policy an open box runs with, written by the cred that opened it.
+    pub fn opened_with(&self, id: &str) -> PathBuf {
+        self.open_dir().join(format!("{id}.policy"))
+    }
+
     pub fn socket(&self, id: &str) -> PathBuf {
         self.sockets.join(format!("{id}.sock"))
     }
