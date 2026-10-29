@@ -13,10 +13,10 @@ keep files) but can't get out. Design: [box-design.md](box-design.md).
 - Data lives in an AES-256 store keyed from the Keychain; `cred box rm` deletes the key.
 - Covers the former items "OS sandbox around the browser", "supply chain of the browser" and the
   encrypted session vault, and parts of the audit log and idle timeouts (for boxes).
-- Decisions are settled (end of the design). Phase 0 spikes 1–5 passed (results in the design):
-  a VM with no network reaches cred only through a published socket; Claude Code runs on the
-  subscription through the door with only a stand-in inside; stores, Chromium and Docker work
-  in VMs. Next: phase 1 (spike 6, Secure Enclave keys, only matters for phase 4).
+- Decisions are settled and phase 0 passed (results in the design). Phase 1 is built and passed
+  its "Done when" checks on a real install (2026-10-29), except `sites`/`fetch` through a box
+  with a real site, and an interactive session. Next: those two, then phase 2 (the smart door:
+  TLS at the door, reads vs writes, `allow = ["*"]`).
 - Done when: phases 1–3 of the design pass their "Done when" tests.
 
 ## 2. Approvals that survive updates
