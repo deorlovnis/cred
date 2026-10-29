@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 
 use super::addr::Net as Dial;
 use super::http::{self, Body, Head};
-use super::inspect::{Ctx, Net, RETRY_BODY, serve};
+use super::inspect::{Caller, Ctx, Net, RETRY_BODY, serve};
 use super::{Config, Shared};
 use crate::chain::Chain;
 use crate::policy::{self, Mode};
@@ -194,7 +194,7 @@ impl Rig {
             Ok(door_upstream)
         };
         let (shared, host) = (shared.clone(), host.to_string());
-        let serving = thread::spawn(move || serve(door_guest, connect, &Ctx { shared: &shared, host: &host }));
+        let serving = thread::spawn(move || serve(door_guest, connect, &Ctx { shared: &shared, host: &host, caller: &Caller::Agent }));
         guest.set_read_timeout(Some(WAIT)).unwrap();
         Self { guest: Conn { reader: BufReader::new(guest.try_clone().unwrap()), stream: guest, seen: Vec::new() }, seen, release, connects, unreachable, serving }
     }
@@ -325,6 +325,8 @@ fn shared(dir: &Path, name: &str, writes: Mode, allow_writes: &[&str]) -> Arc<Sh
         log: dir.join(format!("{name}.log")),
         log_key: LOG_KEY,
         ca: None,
+        browser_socket: None,
+        browser_tokens: Default::default(),
     };
     Arc::new(Shared::new(config, Dial::system()).unwrap())
 }

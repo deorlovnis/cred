@@ -1,0 +1,7 @@
+# Context of `container build -f box/browser.Containerfile .`: the repo root, without its
+# sources and build output; the image copies box/shim and runner/ only.
+*
+!box
+!runner
+box/shim/target
+runner/node_modules

@@ -14,7 +14,7 @@ use std::fs::DirBuilder;
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -36,6 +36,14 @@ const STANDIN: &str = "cred-managed";
 /// and the system's roots.
 pub const CA_CERT: &str = "/usr/local/share/ca-certificates/cred-box.crt";
 const CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
+/// The browser VM's image, and what it holds: where the runner is, the user's home (Chromium runs
+/// as the image's user 1000), and where the Mac's downloads folder appears.
+pub const BROWSER_IMAGE: &str = "cred-browser";
+const BROWSER_HOME: &str = "/home/browser";
+const RUNNER: &str = "/opt/runner/runner.mjs";
+pub const BROWSER_DOWNLOADS: &str = "/downloads";
+/// Where Chromium looks for the CAs it trusts (NSS), under the browser's home.
+const NSS_DB: &str = "/home/browser/.pki/nssdb";
 /// The longest Unix socket path macOS accepts (104 bytes, with the terminating NUL).
 const SOCKET_PATH_MAX: usize = 103;
 
@@ -238,6 +246,94 @@ pub fn install_ca(name: &str, pem: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn browser_vm_name(box_id: &str) -> String {
+    format!("cred-browser-{box_id}")
+}
+
+/// The box's browser VM: one for all of the box's sites, with the same kind of door as the
+/// agent's VM, but through a socket of its own so the door knows whose traffic it is.
+pub struct BrowserSpec {
+    pub name: String,
+    /// "cred-browser@sha256:..." as built by `build_browser_image`.
+    pub image: String,
+    /// Where the browser door's socket appears on the Mac (short, like the agent's).
+    pub socket: PathBuf,
+    /// A folder of the Mac mounted read-write at `/downloads`, for the files pages download.
+    /// It is made (private to the user) if it isn't there. `None`: no mount, and the runner is
+    /// not given a place to save to.
+    pub downloads: Option<PathBuf>,
+}
+
+/// Start the browser VM, detached; it is removed when it stops. The same isolation as the
+/// agent's VM: no network, memory-backed /tmp, `cred-shim serve` as init.
+pub fn run_browser(spec: &BrowserSpec) -> Result<()> {
+    let mut mounts = Vec::new();
+    if let Some(host) = &spec.downloads {
+        DirBuilder::new().recursive(true).mode(0o700).create(host).with_context(|| format!("creating {}", host.display()))?;
+        mounts.push(Mount { host: host.clone(), guest: BROWSER_DOWNLOADS.into(), readonly: false });
+    }
+    run(&VmSpec {
+        name: spec.name.clone(),
+        image: spec.image.clone(),
+        cpus: 2,
+        memory: "2G".into(),
+        socket: spec.socket.clone(),
+        mounts,
+        docker: false,
+    })
+}
+
+/// Start a runner in the browser VM (`node /opt/runner/runner.mjs`, as the VM's user 1000),
+/// speaking its JSON lines on the child's piped stdin and stdout. `env` is on the command
+/// line, so it holds no secrets: the runner gets everything it needs over stdin.
+///
+/// `CRED_RUNNER_DEBUG_*` variables switch protections of the runner off, for tests; a release
+/// build refuses them.
+pub fn exec_runner(vm: &str, env: &[(String, String)]) -> Result<Child> {
+    runner_command(vm, env)?.spawn().context("running container exec")
+}
+
+fn runner_command(vm: &str, env: &[(String, String)]) -> Result<Command> {
+    #[cfg(not(debug_assertions))]
+    if let Some((key, _)) = env.iter().find(|(key, _)| key.starts_with("CRED_RUNNER_DEBUG")) {
+        bail!("{key} is only for tests");
+    }
+    let mut c = container();
+    c.args(["exec", "--uid", AGENT_ID, "--gid", AGENT_ID, "-i"]);
+    let base = [("HOME", BROWSER_HOME), ("PLAYWRIGHT_BROWSERS_PATH", "/ms-playwright")];
+    for (key, value) in base.into_iter().chain(env.iter().map(|(k, v)| (k.as_str(), v.as_str()))) {
+        c.arg("-e").arg(format!("{key}={value}"));
+    }
+    c.arg(vm).args(["node", RUNNER]);
+    c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    Ok(c)
+}
+
+/// Make Chromium in the browser VM trust the box's CA (a public certificate, PEM). Chromium on
+/// Linux trusts what is in its user's NSS database, so the CA goes there, with `certutil`, as
+/// the user the runners run as. The VM's home is thrown away when it stops, so this is done at
+/// every start, before the first runner.
+pub fn install_browser_ca(name: &str, pem: &str) -> Result<()> {
+    let script = format!(
+        "set -e; mkdir -p {NSS_DB}; cat > /tmp/cred-box.crt; \
+         [ -f {NSS_DB}/cert9.db ] || certutil -N -d sql:{NSS_DB} --empty-password; \
+         certutil -A -d sql:{NSS_DB} -t 'C,,' -n cred-box -i /tmp/cred-box.crt; rm -f /tmp/cred-box.crt"
+    );
+    let mut child = container()
+        .args(["exec", "--uid", AGENT_ID, "--gid", AGENT_ID, "-i", "-e", &format!("HOME={BROWSER_HOME}"), name, "sh", "-c", &script])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("running container exec")?;
+    child.stdin.take().expect("piped stdin").write_all(pem.as_bytes()).context("sending the CA to the VM")?;
+    let out = child.wait_with_output().context("installing the CA")?;
+    if !out.status.success() {
+        bail!("installing the box CA in {name}: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
 fn exists(name: &str) -> bool {
     capture(container().args(["inspect", name]), "inspecting the VM").is_ok()
 }
@@ -330,6 +426,28 @@ pub fn build_agent_image(repo_box_dir: &Path) -> Result<String> {
     image_digest(AGENT_IMAGE)
 }
 
+/// Build box/browser.Containerfile (`repo_box_dir` is the repo's `box` folder; the build context
+/// is the repo, which holds the runner) and return the pinned reference of the result.
+pub fn build_browser_image(repo_box_dir: &Path) -> Result<String> {
+    let containerfile = repo_box_dir.join("browser.Containerfile");
+    if !containerfile.is_file() {
+        bail!("no browser.Containerfile in {}", repo_box_dir.display());
+    }
+    let context = repo_box_dir.parent().context("the box folder has no parent")?;
+    let status = container()
+        .arg("build")
+        .arg("-f")
+        .arg(&containerfile)
+        .args(["-t", BROWSER_IMAGE])
+        .arg(context)
+        .status()
+        .context("running container build")?;
+    if !status.success() {
+        bail!("building the browser image failed ({status})");
+    }
+    image_digest(BROWSER_IMAGE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +498,22 @@ mod tests {
              --mount type=bind,source=/Volumes/box/home,target=/home/agent \
              --mount type=bind,source=/Users/me/src,target=/work/src,readonly \
              --entrypoint cred-shim cred-agent:abc serve"
+        );
+    }
+
+    #[test]
+    fn the_runner_starts_in_the_browser_vm_as_its_user() {
+        assert_eq!(browser_vm_name("research"), "cred-browser-research");
+        let env = vec![("CRED_RUNNER_DEBUG_NO_ROUTING".to_string(), "1".to_string())];
+        let cmd = runner_command("cred-browser-research", &env).unwrap();
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            args,
+            [
+                "exec", "--uid", "1000", "--gid", "1000", "-i", "-e", "HOME=/home/browser", "-e",
+                "PLAYWRIGHT_BROWSERS_PATH=/ms-playwright", "-e", "CRED_RUNNER_DEBUG_NO_ROUTING=1", "cred-browser-research",
+                "node", "/opt/runner/runner.mjs"
+            ]
         );
     }
 

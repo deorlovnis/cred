@@ -247,6 +247,8 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
         log: store::door_log(&mnt),
         ca: Some(ca.clone()),
         log_key,
+        browser_socket: None,
+        browser_tokens: door::Tokens::default(),
     };
 
     // Declared in the order they start, so they drop in the order they must end: VM, door, store.

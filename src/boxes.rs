@@ -12,6 +12,7 @@
 //! environment variables hold the stand-in for a site's credential. Fields of a later phase
 //! (`[browser]`) are refused, not ignored.
 
+pub mod browser_vm;
 mod run;
 mod store;
 

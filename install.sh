@@ -43,6 +43,15 @@ elif container build -f box/agent.Containerfile -t cred-agent box; then
 else
   echo "warning: building the agent image failed; boxes won't run until 'container build' of box/agent.Containerfile works" >&2
 fi
+# The browser VM's image: cred's runner and Chromium for the box's sites. Built with the repo as
+# the context (.dockerignore keeps the rest out). Needed only by boxes with sites that browse.
+if command -v container >/dev/null 2>&1 && container system status >/dev/null 2>&1; then
+  if container build -f box/browser.Containerfile -t cred-browser .; then
+    echo "built the browser image cred-browser"
+  else
+    echo "warning: building the browser image failed; boxes can't browse until 'container build' of box/browser.Containerfile works" >&2
+  fi
+fi
 
 # Keychain items are tied to the build that wrote them, so a new cred can't read the old
 # approvals silently: approve the policies again, with one Touch ID for all of them.

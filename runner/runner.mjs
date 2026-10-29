@@ -6,6 +6,10 @@
 // but GET/HEAD/OPTIONS follows `writes` (deny, ask cred, or allow). The agent never talks to
 // this process; cred relays a narrow set of commands and masks what comes back.
 
+import { createHash } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import { mkdir, stat } from 'node:fs/promises';
+import path from 'node:path';
 import readline from 'node:readline';
 import { chromium } from 'playwright-core';
 
@@ -14,12 +18,19 @@ const SNAPSHOT_LIMIT = 60_000;
 const CHANGE_WAIT = 3000;
 const REQUEST_LIMIT = 100;
 const FIND_LIMIT = 50;
+// How long a snapshot waits for a download that is still being saved.
+const DOWNLOAD_WAIT = 120_000;
 let config, browser, context, page;
 const notes = [];
 const requests = new Set();
 let blockedWrites = false;
 const answers = new Map();
 let asks = 0;
+const downloading = new Set();
+// Only for tests of the door (the browser VM's CONNECT checks): the page's requests are not
+// checked here, so only the door stops them. It is refused unless a proxy is set, because the
+// door is what enforces the same rules there.
+const NO_ROUTING = process.env.CRED_RUNNER_DEBUG_NO_ROUTING === '1';
 
 const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\n');
 
@@ -105,6 +116,7 @@ const ariaSnapshot = (target) => target.ariaSnapshot({ mode: 'ai', timeout: 10_0
 
 async function describe({ ref, compact } = {}) {
   await settle();
+  await Promise.race([Promise.allSettled([...downloading]), new Promise((r) => setTimeout(r, DOWNLOAD_WAIT))]);
   let snap = await ariaSnapshot(ref ? locate(ref) : page.locator(':root'));
   // A snapshot of one element drops the refs outside it; take the whole page again so they work.
   if (ref) await ariaSnapshot(page.locator(':root'));
@@ -166,6 +178,46 @@ async function acting(action) {
   return describe();
 }
 
+// A file name from a page is untrusted: only its last part is kept, without anything a shell or
+// a file system treats specially, and never a hidden file.
+function safeName(raw) {
+  const base = path.basename(String(raw ?? '').replaceAll('\\', '/'));
+  const name = base.replace(/[^\p{L}\p{N}._ ()+,@-]/gu, '_').replace(/^\.+/, '_').slice(0, 120);
+  return name || 'download';
+}
+
+async function sha256(file) {
+  const hash = createHash('sha256');
+  for await (const chunk of createReadStream(file)) hash.update(chunk);
+  return hash.digest('hex');
+}
+
+// Save a download to the folder cred gave (the browser VM mounts it from the Mac) and say what
+// was saved in the next snapshot. Without a folder the download is refused.
+function onDownload(download) {
+  const saving = (async () => {
+    const name = safeName(download.suggestedFilename());
+    if (!config.downloads) {
+      note(`blocked download ${name} (downloads aren't allowed)`);
+      return;
+    }
+    try {
+      await mkdir(config.downloads, { recursive: true });
+      const ext = path.extname(name);
+      let target = path.join(config.downloads, name);
+      for (let n = 1; await stat(target).then(() => true, () => false); n++) {
+        target = path.join(config.downloads, `${name.slice(0, name.length - ext.length)} (${n})${ext}`);
+      }
+      await download.saveAs(target);
+      note(`saved download ${path.basename(target)} (${(await stat(target)).size} bytes, sha256 ${await sha256(target)})`);
+    } catch (e) {
+      note(`download ${name} failed: ${String(e?.message ?? e).split('\n')[0]}`);
+    }
+  })();
+  downloading.add(saving);
+  saving.finally(() => downloading.delete(saving));
+}
+
 const locate = (ref) => {
   if (!/^[a-z0-9]{1,16}$/i.test(String(ref))) throw new Error(`not an element ref: ${ref}`);
   return page.locator(`aria-ref=${ref}`);
@@ -174,20 +226,26 @@ const locate = (ref) => {
 const commands = {
   async open(msg) {
     config = msg.config;
-    // Playwright passes --no-sandbox unless asked for Chromium's own sandbox.
-    browser = await chromium.launch({ headless: true, chromiumSandbox: true });
+    if (NO_ROUTING && !config.proxy) throw new Error('request routing can only be switched off behind a proxy');
+    // Playwright passes --no-sandbox unless asked for Chromium's own sandbox. In the browser VM
+    // every connection goes to the door, as the site named in `proxy` (cred's identity for it).
+    browser = await chromium.launch({ headless: true, chromiumSandbox: true, ...(config.proxy ? { proxy: config.proxy } : {}) });
     context = await browser.newContext({
       serviceWorkers: 'block',
-      acceptDownloads: false,
+      acceptDownloads: Boolean(config.downloads),
       viewport: { width: 1280, height: 900 },
+      ...(config.storageState ? { storageState: config.storageState } : {}),
     });
-    await context.route('**/*', guard);
+    context.on('page', (p) => p.on('download', onDownload));
+    if (!NO_ROUTING) {
+      await context.route('**/*', guard);
+      await context.routeWebSocket(/.*/, (ws) => {
+        if (allowed(config.origins.concat(config.requests), originOf(ws.url()))) return ws.connectToServer();
+        note(`blocked websocket ${ws.url().slice(0, 120)}`);
+        ws.close();
+      });
+    }
     context.on('request', recordRequest);
-    await context.routeWebSocket(/.*/, (ws) => {
-      if (allowed(config.origins.concat(config.requests), originOf(ws.url()))) return ws.connectToServer();
-      note(`blocked websocket ${ws.url().slice(0, 120)}`);
-      ws.close();
-    });
     if (config.cookies.length) await context.addCookies(config.cookies);
     if (config.storage.length) {
       await context.addInitScript((entries) => {
@@ -203,7 +261,7 @@ const commands = {
     return describe();
   },
   async goto({ url }) {
-    if (!allowed(config.origins, originOf(url))) throw new Error(`${originOf(url) ?? url} isn't one of the pages this site allows`);
+    if (!NO_ROUTING && !allowed(config.origins, originOf(url))) throw new Error(`${originOf(url) ?? url} isn't one of the pages this site allows`);
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     return describe();
   },
@@ -239,9 +297,12 @@ const commands = {
     await page.goBack({ timeout: 15_000 });
     return describe();
   },
+  // Hands the session (cookies and Local Storage, as Playwright's storageState) back to cred,
+  // which seals it; nothing is kept here.
   async close() {
+    const storageState = context ? await context.storageState().catch(() => null) : null;
     await browser?.close();
-    return 'closed';
+    return JSON.stringify({ storageState });
   },
 };
 

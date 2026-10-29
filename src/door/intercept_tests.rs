@@ -24,7 +24,7 @@ use super::{Config, Door};
 use crate::policy::Mode;
 use crate::util::TempDir;
 
-const WAIT: Duration = Duration::from_secs(10);
+pub(super) const WAIT: Duration = Duration::from_secs(10);
 
 /// What the fake site saw: request line, and body.
 type Seen = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
@@ -64,9 +64,9 @@ fn site(signer: &BoxCa, name: &str) -> (SocketAddr, Seen) {
 }
 
 /// The guest's side of the stream after CONNECT: what is left in the reader, and the socket.
-struct Duplex {
-    reader: BufReader<UnixStream>,
-    writer: UnixStream,
+pub(super) struct Duplex {
+    pub(super) reader: BufReader<UnixStream>,
+    pub(super) writer: UnixStream,
 }
 
 impl Read for Duplex {
@@ -85,15 +85,36 @@ impl Write for Duplex {
     }
 }
 
-type Guest = StreamOwned<ClientConnection, Duplex>;
+pub(super) type Guest = StreamOwned<ClientConnection, Duplex>;
 
 /// The listener the guest's shim would hold; the door dials the connections it hands out.
-struct Shim(UnixListener);
+pub(super) struct Shim(pub(super) UnixListener);
 
 impl Shim {
     /// Take a connection, ask for the proxy and CONNECT to `target`. The status of the answer,
     /// its reason phrase, and the connection.
-    fn connect(&self, target: &str) -> (u16, String, Duplex) {
+    pub(super) fn connect(&self, target: &str) -> (u16, String, Duplex) {
+        self.connect_with(target, "")
+    }
+
+    /// The same, with more header lines (each ending in CRLF) on the CONNECT.
+    pub(super) fn connect_with(&self, target: &str, headers: &str) -> (u16, String, Duplex) {
+        let mut io = self.take();
+        writeln!(io.writer, "proxy").unwrap();
+        let (status, reason) = Self::send_connect(&mut io, target, headers);
+        (status, reason, io)
+    }
+
+    /// A CONNECT on a connection already taken; the status of the answer and its reason phrase.
+    pub(super) fn send_connect(io: &mut Duplex, target: &str, headers: &str) -> (u16, String) {
+        write!(io.writer, "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n{headers}\r\n").unwrap();
+        let head = http::read_head(&mut io.reader).unwrap().expect("an answer");
+        let status = head.line.split(' ').nth(1).unwrap().parse().unwrap();
+        (status, head.line.splitn(3, ' ').nth(2).unwrap_or("").to_string())
+    }
+
+    /// Take one of the connections the door dialed.
+    pub(super) fn take(&self) -> Duplex {
         let end = Instant::now() + WAIT;
         let stream = loop {
             match self.0.accept() {
@@ -104,18 +125,12 @@ impl Shim {
         };
         stream.set_nonblocking(false).unwrap();
         stream.set_read_timeout(Some(WAIT)).unwrap();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let mut writer = stream;
-        write!(writer, "proxy\nCONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").unwrap();
-        let head = http::read_head(&mut reader).unwrap().expect("an answer");
-        let status = head.line.split(' ').nth(1).unwrap().parse().unwrap();
-        let reason = head.line.splitn(3, ' ').nth(2).unwrap_or("").to_string();
-        (status, reason, Duplex { reader, writer })
+        Duplex { reader: BufReader::new(stream.try_clone().unwrap()), writer: stream }
     }
 }
 
 /// A TLS client like the tools in the VM: only `trusting` is a root, `alpn` is offered.
-fn client(trusting: &BoxCa, alpn: &[&[u8]], host: &str, io: Duplex) -> Guest {
+pub(super) fn client(trusting: &BoxCa, alpn: &[&[u8]], host: &str, io: Duplex) -> Guest {
     let mut config = (*client_config_trusting(trust_only(&trusting.cert_pem()))).clone();
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     let name = ServerName::try_from(host.to_string()).unwrap();
@@ -134,12 +149,12 @@ fn request(tls: &mut Guest, line: &str, body: &str) -> (String, Vec<u8>) {
     (head.line, answer)
 }
 
-fn log_lines(path: &std::path::Path) -> Vec<Value> {
+pub(super) fn log_lines(path: &std::path::Path) -> Vec<Value> {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     text.lines().map(|l| serde_json::from_str(l).unwrap()).collect()
 }
 
-fn wait_for<T>(mut found: impl FnMut() -> Option<T>) -> T {
+pub(super) fn wait_for<T>(mut found: impl FnMut() -> Option<T>) -> T {
     let end = Instant::now() + WAIT;
     loop {
         if let Some(value) = found() {
@@ -178,7 +193,7 @@ fn the_door_ends_tls_for_a_guest_that_trusts_only_the_box_ca() {
     shim.0.set_nonblocking(true).unwrap();
     let log = dir.0.join("log").join("door.log");
     let door = Door::start_with(
-        Config { name: "testbox".into(), socket, allow: vec!["*".into()], model: None, sites: vec![], net: inspect::Net { writes: Mode::Allow, allow_writes: vec![] }, log_key: [9; 32], log: log.clone(), ca: Some(box_ca.clone()) },
+        Config { name: "testbox".into(), socket, allow: vec!["*".into()], model: None, sites: vec![], net: inspect::Net { writes: Mode::Allow, allow_writes: vec![] }, log_key: [9; 32], log: log.clone(), ca: Some(box_ca.clone()), browser_socket: None, browser_tokens: Default::default() },
         net,
     )
     .unwrap();
@@ -289,7 +304,7 @@ fn real_vm_tools_trust_the_door_and_only_the_door() {
     };
     let ca = Arc::new(BoxCa::generate("e2e").unwrap());
     let log = dir.join("log").join("door.log");
-    let config = Config { name: name.clone(), socket: spec.socket.clone(), allow: vec!["*".into()], model: None, sites: vec![], net: Default::default(), log_key: [9; 32], log: log.clone(), ca: Some(ca.clone()) };
+    let config = Config { name: name.clone(), socket: spec.socket.clone(), allow: vec!["*".into()], model: None, sites: vec![], net: Default::default(), log_key: [9; 32], log: log.clone(), ca: Some(ca.clone()), browser_socket: None, browser_tokens: Default::default() };
     let door = Door::start(config).unwrap();
     let vm = Vm(name.clone());
     engine::run(&spec).unwrap();
