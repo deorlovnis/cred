@@ -1,20 +1,23 @@
 #!/bin/sh
-# Build, sign and install cred to ~/.local/bin.
+# Build, sign and install cred as /usr/local/bin/cred, owned by root so nothing running as you
+# can replace it.
 #
-# Signing with a stable identity keeps macOS "Always Allow" Keychain approvals across
-# rebuilds; an ad-hoc signed build counts as a new app every time. Without the identity
-# the build is installed ad-hoc signed, with a warning. See README "Signing".
+# The signing key asks before every signing: choose "Allow", never "Always Allow". Otherwise
+# any program running as you could sign a lookalike cred that the Keychain trusts. Without the
+# identity the build is installed ad-hoc signed, with a warning. See README "Signing".
 set -eu
 cd "$(dirname "$0")"
 identity="${CRED_SIGN_IDENTITY:-cred code signing}"
-dest="${CRED_INSTALL_DIR:-$HOME/.local/bin}"
+dest=/usr/local/bin/cred
 
 cargo build --release
 if security find-identity -p codesigning | grep -qF "\"$identity\""; then
+  echo "macOS asks to use the \"$identity\" key: choose Allow, not Always Allow."
   codesign --force --sign "$identity" --identifier com.deorlovnis.cred target/release/cred
 else
   echo "warning: no '$identity' signing identity; installing ad-hoc signed (Keychain will ask again after each update)" >&2
 fi
-mkdir -p "$dest"
-install -m 755 target/release/cred "$dest/cred"
-echo "installed $dest/cred"
+echo "Installing $dest (sudo asks for your password)."
+sudo install -d -o root -g wheel -m 755 "$(dirname "$dest")"
+sudo install -o root -g wheel -m 755 target/release/cred "$dest"
+echo "installed $dest"

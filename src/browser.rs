@@ -4,12 +4,13 @@
 //! Firefox keeps each site's Local Storage in
 //! <profile>/storage/default/<scheme>+++<host>[+port][^userContextId=N]/ls/data.sqlite.
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::{env, fs, process};
+use std::{env, fs};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
+
+use crate::util::TempDir;
 
 /// A browser source, written `firefox:https://example.com#storage_key`.
 pub struct Source {
@@ -111,7 +112,7 @@ enum Lookup {
 /// Look KEY up in a copy of the database: Firefox keeps it open, and recent writes may still
 /// sit in the -wal file. The copy is private and removed afterwards.
 fn read_key(db: &Path, key: &str) -> Result<Lookup> {
-    let tmp = TempDir::new()?;
+    let tmp = TempDir::new("cred-firefox")?;
     for suffix in ["", "-wal"] {
         let src = PathBuf::from(format!("{}{suffix}", db.display()));
         if src.is_file() {
@@ -152,24 +153,6 @@ fn decode(conversion: i64, compression: i64, bytes: &[u8]) -> Result<String> {
     }
     let units: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
     String::from_utf16(&units).context("Firefox value is not UTF-16")
-}
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new() -> Result<Self> {
-        let dir = env::temp_dir().join(format!("cred-firefox-{}", process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir(&dir)?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
-        Ok(Self(dir))
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
 }
 
 #[cfg(test)]
