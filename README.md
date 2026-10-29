@@ -44,6 +44,15 @@ cred env app token APP_TOKEN
 cred refresh app --force                     # refresh now (without --force: only if due)
 ```
 
+For logins only a browser can do (Google sign-in, other SSO), sign in there and let cred read the session the site keeps in Local Storage. The value never leaves cred:
+
+```sh
+cred auto app session --from 'firefox:https://app.example.com#session_token'
+cred auto app token --cmd ~/.config/cred/refresh/app.sh   # uses $CRED_SESSION
+```
+
+Firefox only for now (default profile; `CRED_FIREFOX_PROFILE` overrides). When the session expires, sign in on the site again.
+
 A field is refreshed within an hour of expiring (daily if its expiry is unknown) — automatically right before `cred run` uses it and during `cred check`. JWT values get their exact expiry from the token.
 
 Metadata (never values) is kept in `~/.config/cred/index.json`; override with `CRED_INDEX`. `CRED_WARN_DAYS` sets the warning window.

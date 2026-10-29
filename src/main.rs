@@ -6,6 +6,8 @@
 //! env var; the rest (e.g. a login) stay inside cred and reach only the resource's
 //! refresh command. Metadata lives in ~/.config/cred/index.json — never values.
 
+mod browser;
+
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::unix::process::ExitStatusExt;
@@ -95,17 +97,23 @@ enum Cmd {
         #[command(flatten)]
         meta: Meta,
     },
-    /// Refresh a field automatically (--cmd) or stop (--off); no flags shows the setting
-    #[command(after_help = "The command must print the new value on stdout. It gets the \
-                            resource's fields as CRED_<FIELD>, e.g. CRED_USER and CRED_PASSWORD.")]
+    /// Refresh a field automatically (--cmd or --from) or stop (--off); no flags shows the setting
+    #[command(after_help = "A --cmd command must print the new value on stdout. It gets the \
+                            resource's fields as CRED_<FIELD>, e.g. CRED_USER and CRED_SESSION.\n\
+                            --from reads a key the browser keeps for a site after you sign in there, \
+                            e.g. firefox:https://app.example.com#session_token. The value never \
+                            leaves cred.")]
     Auto {
         #[arg(value_parser = parse_resource)]
         resource: String,
         #[arg(value_parser = parse_field)]
         field: String,
         /// Shell command that prints a fresh value on stdout
-        #[arg(long, conflicts_with = "off")]
+        #[arg(long, conflicts_with_all = ["off", "from"])]
         cmd: Option<String>,
+        /// Browser Local Storage to read: BROWSER:ORIGIN#KEY
+        #[arg(long, conflicts_with = "off", value_parser = parse_source)]
+        from: Option<String>,
         #[arg(long)]
         off: bool,
     },
@@ -176,6 +184,10 @@ fn parse_env(s: &str) -> Result<String, String> {
     if ok { Ok(s.to_string()) } else { Err("use ENV_VAR style, e.g. GITHUB_TOKEN".into()) }
 }
 
+fn parse_source(s: &str) -> Result<String, String> {
+    browser::Source::parse(s).map(|_| s.to_string())
+}
+
 fn parse_date(s: &str) -> Result<Date, String> {
     match s.parse::<Date>() {
         Ok(d) if s.len() == 10 => Ok(d),
@@ -207,9 +219,12 @@ struct Field {
     /// Exact expiry, read from the value when it is a JWT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expires_at: Option<Timestamp>,
-    /// Shell command that prints a fresh value; set with `cred auto`.
+    /// Shell command that prints a fresh value; set with `cred auto --cmd`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     refresh: Option<String>,
+    /// Browser source the value is read from; set with `cred auto --from`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    from: Option<String>,
 }
 
 impl Resource {
@@ -223,11 +238,19 @@ impl Resource {
     }
 
     fn has_auto(&self) -> bool {
-        self.fields.values().any(|f| f.refresh.is_some())
+        self.fields.values().any(Field::is_auto)
     }
 }
 
 impl Field {
+    fn is_auto(&self) -> bool {
+        self.refresh.is_some() || self.from.is_some()
+    }
+
+    fn auto_text(&self) -> Option<String> {
+        self.from.as_ref().map(|s| format!("from {s}")).or_else(|| self.refresh.clone())
+    }
+
     /// Due within the hour of an exact expiry, on the expiry date, or daily when expiry is unknown.
     fn due(&self) -> bool {
         match (self.expires_at, self.expires, self.updated) {
@@ -534,10 +557,10 @@ fn cmd_describe(res: &str, mut meta: Meta) -> Result<()> {
     Ok(())
 }
 
-fn cmd_auto(res: &str, field: &str, cmd: Option<String>, off: bool) -> Result<()> {
+fn cmd_auto(res: &str, field: &str, cmd: Option<String>, from: Option<String>, off: bool) -> Result<()> {
     let mut idx = Index::load()?;
-    if cmd.is_none() && !off {
-        let current = idx.map.get(res).and_then(|r| r.fields.get(field)).and_then(|f| f.refresh.as_deref());
+    if cmd.is_none() && from.is_none() && !off {
+        let current = idx.map.get(res).and_then(|r| r.fields.get(field)).and_then(Field::auto_text);
         match current {
             Some(c) => println!("{res}/{field} refreshes with: {c}"),
             None => println!("{res}/{field} has no auto-refresh"),
@@ -547,24 +570,40 @@ fn cmd_auto(res: &str, field: &str, cmd: Option<String>, off: bool) -> Result<()
     // Auto-refresh may be set up before the first value exists; the first refresh creates it.
     let f = idx.map.entry(res.to_string()).or_default().fields.entry(field.to_string()).or_default();
     f.refresh = cmd;
+    f.from = from;
     // Learn the exact expiry of a value stored before, so the first refresh happens on time.
-    if f.refresh.is_some()
+    if f.is_auto()
         && f.expires_at.is_none()
         && let Some(t) = kc_get(res, field).as_deref().and_then(jwt_exp)
     {
         f.expires_at = Some(t);
         f.expires = Some(local_date(t));
     }
-    let on = f.refresh.is_some();
+    let on = f.is_auto();
     idx.save()?;
     println!("auto-refresh {} for {res}/{field}", if on { "on" } else { "off" });
     Ok(())
 }
 
-/// Run a field's refresh command and store what it prints. The resource's fields are passed
-/// as CRED_<FIELD>. Messages go to stderr, so a refresh inside `cred run` never mixes into
-/// the command's output.
-fn refresh_one(res: &str, r: &Resource, field: &str, cmd: &str) -> Result<()> {
+/// Get a field's fresh value from its browser source or refresh command, and store it.
+/// Messages go to stderr, so a refresh inside `cred run` never mixes into the command's output.
+fn refresh_one(res: &str, r: &Resource, field: &str, f: &Field) -> Result<()> {
+    let value = match (&f.from, &f.refresh) {
+        (Some(spec), _) => browser::Source::parse(spec).map_err(anyhow::Error::msg)?.read()?,
+        (None, Some(cmd)) => run_refresh_cmd(res, r, field, cmd)?,
+        (None, None) => bail!("{res}/{field} has no auto-refresh"),
+    };
+    let value = value.trim();
+    if value.is_empty() || value.contains(char::is_whitespace) {
+        bail!("refresh of {res}/{field} must produce exactly one value");
+    }
+    let suffix = store(res, field, value, Expiry::Keep, None, &Meta::default())?;
+    eprintln!("cred: refreshed {res}/{field}{suffix}");
+    Ok(())
+}
+
+/// Run a refresh command with the resource's fields as CRED_<FIELD>; returns its stdout.
+fn run_refresh_cmd(res: &str, r: &Resource, field: &str, cmd: &str) -> Result<String> {
     let mut command = Command::new("sh");
     for name in r.fields.keys() {
         if let Some(v) = kc_get(res, name) {
@@ -581,13 +620,7 @@ fn refresh_one(res: &str, r: &Resource, field: &str, cmd: &str) -> Result<()> {
     if !out.status.success() {
         bail!("refresh command for {res}/{field} failed ({})", out.status);
     }
-    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if value.is_empty() || value.contains(char::is_whitespace) {
-        bail!("refresh command for {res}/{field} must print exactly one value");
-    }
-    let suffix = store(res, field, &value, Expiry::Keep, None, &Meta::default())?;
-    eprintln!("cred: refreshed {res}/{field}{suffix}");
-    Ok(())
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Refresh each auto field of the given resources that is due (or all with force).
@@ -600,14 +633,22 @@ fn refresh_due(resources: &[String], force: bool, verbose: bool) -> bool {
     let mut ok = true;
     for res in resources {
         let Some(r) = idx.map.get(res) else { continue };
-        for (field, f) in &r.fields {
-            let Some(cmd) = &f.refresh else { continue };
-            if force || f.due() {
-                if let Err(err) = refresh_one(res, r, field, cmd) {
-                    eprintln!("cred: {err:#}");
-                    ok = false;
-                }
-            } else if verbose {
+        let due: Vec<&String> = r.fields.iter().filter(|(_, f)| f.is_auto() && (force || f.due())).map(|(n, _)| n).collect();
+        // Browser-sourced fields are cheap to re-read and usually feed the others (a session that
+        // mints a token), so whenever anything is due they go first.
+        let mut order: Vec<&String> = Vec::new();
+        if !due.is_empty() {
+            order.extend(r.fields.iter().filter(|(_, f)| f.from.is_some()).map(|(n, _)| n));
+            order.extend(due.iter().copied().filter(|n| r.fields[*n].from.is_none()));
+        }
+        for field in &order {
+            if let Err(err) = refresh_one(res, r, field, &r.fields[*field]) {
+                eprintln!("cred: {err:#}");
+                ok = false;
+            }
+        }
+        if verbose {
+            for (field, f) in r.fields.iter().filter(|(n, f)| f.is_auto() && !order.contains(n)) {
                 let until = f.expiry_text().map_or(String::new(), |t| format!(" (expires {t})"));
                 eprintln!("cred: {res}/{field} is fresh{until}");
             }
@@ -651,8 +692,8 @@ fn cmd_info(res: &str) -> Result<()> {
             parts.push(format!("updated {u}"));
         }
         println!("{name:<12} {}", parts.join(", "));
-        if let Some(cmd) = &f.refresh {
-            println!("{:<12}   auto-refresh: {cmd}", "");
+        if let Some(auto) = f.auto_text() {
+            println!("{:<12}   auto-refresh: {auto}", "");
         }
     }
     Ok(())
@@ -666,7 +707,7 @@ fn field_status(res: &str, name: &str, f: &Field, warn: i64) -> (i64, String) {
     if f.expired() {
         return (i64::MAX - 1, "EXPIRED".into());
     }
-    if f.refresh.is_some() {
+    if f.is_auto() {
         return (1, "auto".into());
     }
     match f.expires.map(days_left) {
@@ -712,7 +753,7 @@ fn cmd_check(days: Option<i64>) -> Result<u8> {
         for (name, f) in &r.fields {
             let Some(exp) = f.expires else { continue };
             let d = days_left(exp);
-            let msg = if f.refresh.is_some() {
+            let msg = if f.is_auto() {
                 if !f.expired() {
                     continue;
                 }
@@ -858,7 +899,7 @@ fn main() -> ExitCode {
         Cmd::Update { resource, field, expires } => ok(cmd_update(&resource, &field, expires)),
         Cmd::Env { resource, field, var, off: _ } => ok(cmd_env(&resource, &field, var)),
         Cmd::Describe { resource, meta } => ok(cmd_describe(&resource, meta)),
-        Cmd::Auto { resource, field, cmd, off } => ok(cmd_auto(&resource, &field, cmd, off)),
+        Cmd::Auto { resource, field, cmd, from, off } => ok(cmd_auto(&resource, &field, cmd, from, off)),
         Cmd::Refresh { resources, force } => cmd_refresh(resources, force),
         Cmd::Info { resource } => ok(cmd_info(&resource)),
         Cmd::Ls => ok(cmd_ls()),
