@@ -5,7 +5,7 @@
 //! after the times the policy sets.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Instant;
@@ -70,15 +70,42 @@ struct Server {
     /// The browser's idle and total-time deadlines; set while `browser` is.
     lease: Option<Lease>,
     audit: Log,
+    scope: Scope,
+}
+
+/// What one MCP connection may do.
+pub struct Scope {
+    /// The only sites offered; `None` offers every site with an approved policy.
+    sites: Option<Vec<String>>,
+    /// Sites need no consent prompt of their own: the user already approved this session.
+    consented: bool,
+    /// The box the connection comes from, named in the audit log.
+    box_name: Option<String>,
+}
+
+impl Scope {
+    /// `cred mcp`: every approved site, each asking for consent as its policy says.
+    pub fn all() -> Self {
+        Self { sites: None, consented: false, box_name: None }
+    }
+
+    /// A box's connection: only its sites, and consent already given by the box run's Touch ID.
+    pub fn boxed(name: &str, sites: &[String]) -> Self {
+        Self { sites: Some(sites.to_vec()), consented: true, box_name: Some(name.to_string()) }
+    }
 }
 
 pub fn serve() -> Result<()> {
-    let mut server = Server::start();
-    let mut stdout = io::stdout().lock();
+    serve_io(BufReader::new(io::stdin()), io::stdout().lock(), Scope::all())
+}
+
+/// Serve MCP (one JSON-RPC message per line) until the reader ends.
+pub fn serve_io(reader: impl BufRead + Send + 'static, mut writer: impl Write, scope: Scope) -> Result<()> {
+    let mut server = Server::start(scope);
     // Lines arrive through a channel so the loop can wake up to close a browser that went idle.
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        for line in io::stdin().lock().lines() {
+        for line in reader.lines() {
             if tx.send(line).is_err() {
                 break;
             }
@@ -104,8 +131,8 @@ pub fn serve() -> Result<()> {
             continue;
         }
         if let Some(reply) = server.handle(&line) {
-            writeln!(stdout, "{reply}")?;
-            stdout.flush()?;
+            writeln!(writer, "{reply}")?;
+            writer.flush()?;
         }
     }
     Ok(())
@@ -113,10 +140,10 @@ pub fn serve() -> Result<()> {
 
 impl Server {
     /// Offer the sites whose policy is approved now; others are skipped with a note on stderr.
-    fn start() -> Self {
+    fn start(scope: Scope) -> Self {
         let (mut sites, mut browsable, mut tools) = (Vec::new(), Vec::new(), BTreeMap::new());
         let mut fillable = false;
-        for site in policy::names() {
+        for site in scope.sites.clone().unwrap_or_else(policy::names) {
             let approved = match policy::load(&site) {
                 Ok(a) => a,
                 Err(e) => {
@@ -148,6 +175,7 @@ impl Server {
             browser: None,
             lease: None,
             audit: Log::standard(true),
+            scope,
         }
     }
 
@@ -191,7 +219,9 @@ impl Server {
         let result = self.run_tool(name, args);
         let decision = audit::decide(&approve::take_answers(), result["isError"].as_bool() != Some(false));
         let masker = Masker::new(Index::load().map(|i| i.values(&site)).unwrap_or_default());
-        if let Err(e) = self.audit.append(Body::new(&site, name, method.as_deref(), url.as_deref(), decision, &masker)) {
+        let mut entry = Body::new(&site, name, method.as_deref(), url.as_deref(), decision, &masker);
+        entry.boxed = self.scope.box_name.clone();
+        if let Err(e) = self.audit.append(entry) {
             return refused(e);
         }
         if name.starts_with("browse_") {
@@ -416,7 +446,7 @@ impl Server {
     fn consent(&mut self, site: &str, approved: &Approved) -> Result<()> {
         let minutes = approved.policy.agent.consent_minutes;
         let holds = |granted: &Instant| limits::consent_holds(*granted, Instant::now(), minutes);
-        if approved.policy.agent.consent == Consent::None || self.consented.get(site).is_some_and(holds) {
+        if self.scope.consented || approved.policy.agent.consent == Consent::None || self.consented.get(site).is_some_and(holds) {
             return Ok(());
         }
         let how_long = if minutes == 0 { "until it disconnects".to_string() } else { format!("for {minutes} minutes") };

@@ -227,7 +227,7 @@ impl Site {
         }
     }
 
-    fn matches(&self, origin: &str) -> bool {
+    pub fn matches(&self, origin: &str) -> bool {
         match self {
             Site::Any => origin.starts_with("https://"),
             Site::Exact(o) => o == origin,

@@ -212,6 +212,9 @@ impl BoxPolicy {
                 bail!("sites lists {site} twice");
             }
         }
+        if self.docker {
+            bail!("docker = true isn't available yet: the agent image has no Docker Engine");
+        }
         if !(1..=64).contains(&self.cpus) {
             bail!("cpus must be between 1 and 64");
         }
@@ -275,7 +278,6 @@ sites = []                              # resources the agent may use through cr
 keep = true                             # false: the box is shredded when it stops
 cpus = 4
 memory = "8G"
-# docker = true                         # Docker Engine inside the box (extra capabilities in the VM)
 
 [net]                                   # where the agent's own requests may go; nothing else is reachable
 allow = []                              # ["*"] = any public https site, or a list like ["https://*.wikipedia.org"]
@@ -666,7 +668,6 @@ mod tests {
             keep = false
             cpus = 2
             memory = "512M"
-            docker = true
 
             [net]
             allow = ["*", "https://*.wikipedia.org", "https://docs.rs", "https://Example.com"]
@@ -681,7 +682,7 @@ mod tests {
             "#
         ))
         .unwrap();
-        assert_eq!((p.keep, p.cpus, p.memory.as_str(), p.docker), (false, 2, "512M", true));
+        assert_eq!((p.keep, p.cpus, p.memory.as_str(), p.docker), (false, 2, "512M", false));
         assert_eq!(p.allow(), ["*", "https://*.wikipedia.org", "https://docs.rs", "https://example.com"]);
         assert_eq!((p.mounts[0].name(), p.mounts[0].readonly()), ("cred".to_string(), false));
         assert_eq!((p.mounts[1].name(), p.mounts[1].readonly()), ("data".to_string(), true));
@@ -699,6 +700,7 @@ mod tests {
         for (text, why) in [
             ("[net]\nwrites = \"allow\"", "phase 2"),
             ("[net]\nwrites = \"ask\"", "phase 2"),
+            ("docker = true", "docker = true isn't available"),
             ("[net]\nallow_writes = [\"https://a.example.com\"]", "phase 2"),
             ("[browser]\nkeep_sessions = true", "phase 3"),
             ("[[mount]]\npath = \"/opt/data\"\nmode = \"rw\"", "rw isn't available"),
