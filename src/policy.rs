@@ -197,14 +197,14 @@ pub struct BrowseStorage {
 
 /// A site the browser may use: an exact origin, "https://*.example.com" (that domain and its
 /// subdomains), or "*" (any https site).
-enum Site {
+pub enum Site {
     Any,
     Domain { scheme: String, domain: String },
     Exact(String),
 }
 
 impl Site {
-    fn parse(entry: &str) -> Result<Self> {
+    pub fn parse(entry: &str) -> Result<Self> {
         if entry == "*" {
             return Ok(Site::Any);
         }
@@ -227,7 +227,7 @@ impl Site {
         }
     }
 
-    fn matches(&self, origin: &str) -> bool {
+    pub fn matches(&self, origin: &str) -> bool {
         match self {
             Site::Any => origin.starts_with("https://"),
             Site::Exact(o) => o == origin,

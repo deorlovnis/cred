@@ -61,6 +61,9 @@ pub struct Body {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     pub decision: Decision,
+    /// The box the call came from, if it came through one.
+    #[serde(default, rename = "box", skip_serializing_if = "Option::is_none")]
+    pub boxed: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -81,6 +84,7 @@ impl Body {
             method: method.map(|m| clip(&m.to_ascii_uppercase(), 16)),
             url: url.map(|u| mask_url(u, masker)),
             decision,
+            boxed: None,
         }
     }
 }
@@ -295,7 +299,11 @@ pub fn show(n: usize, verify: bool) -> Result<()> {
     }
     for e in entries {
         let what = [e.method.as_deref(), e.url.as_deref()].into_iter().flatten().collect::<Vec<_>>().join(" ");
-        println!("{}  {}  {}  {}  [{}]", e.time, e.site, e.tool, what, serde_json::to_value(e.decision)?.as_str().unwrap_or(""));
+        let site = match &e.boxed {
+            Some(b) => format!("{b}/{}", e.site),
+            None => e.site.clone(),
+        };
+        println!("{}  {}  {}  {}  [{}]", e.time, site, e.tool, what, serde_json::to_value(e.decision)?.as_str().unwrap_or(""));
     }
     Ok(())
 }
