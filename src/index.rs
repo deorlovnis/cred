@@ -18,8 +18,9 @@ use serde::{Deserialize, Serialize};
 use crate::keychain;
 use crate::util::config_dir;
 
-/// Auto-refresh a field once it is this close to expiring.
-const REFRESH_MARGIN_SECS: i64 = 3600;
+/// Auto-refresh a field once it is this close to its exact expiry. Short: some tokens only
+/// live an hour, and a larger margin would renew them on every use.
+const REFRESH_MARGIN_SECS: i64 = 300;
 
 #[derive(Args, Default)]
 pub struct Meta {
@@ -64,7 +65,7 @@ impl Resource {
 }
 
 impl Field {
-    /// Due within the hour of an exact expiry, on the expiry date, or daily when expiry is unknown.
+    /// Due in the last minutes before an exact expiry, on the expiry date, or daily when expiry is unknown.
     pub fn due(&self) -> bool {
         match (self.expires_at, self.expires, self.updated) {
             (Some(t), _, _) => t.as_second() - Timestamp::now().as_second() < REFRESH_MARGIN_SECS,

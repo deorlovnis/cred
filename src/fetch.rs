@@ -48,6 +48,9 @@ pub fn perform(res: &str, approved: &Approved, req: &Request) -> Result<String> 
         })?;
         request = request.header(fetch.auth_header.as_str(), value);
     }
+    for (name, value) in &fetch.headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
     if let Some(content_type) = req.content_type {
         request = request.header("content-type", content_type);
     }

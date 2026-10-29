@@ -97,6 +97,9 @@ pub struct Fetch {
     pub auth: Option<String>,
     #[serde(default = "default_auth_header")]
     pub auth_header: String,
+    /// Fixed, non-secret headers the site expects on every request, e.g. a client id.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
 }
 
 fn default_auth_header() -> String {
@@ -150,8 +153,18 @@ impl Policy {
                     parse_field(&name).map_err(|e| anyhow!("[fetch] auth {{{name}}}: {e}"))?;
                 }
             }
-            if fetch.auth_header.is_empty() || !fetch.auth_header.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            let is_name = |h: &str| !h.is_empty() && h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+            if !is_name(&fetch.auth_header) {
                 bail!("[fetch] auth_header must be a header name");
+            }
+            for (name, value) in &fetch.headers {
+                if !is_name(name) || value.contains(['\r', '\n']) {
+                    bail!("[fetch] headers: '{name}' isn't a valid header");
+                }
+                // Values are fixed text: they can't carry a stored value or replace the credentials.
+                if value.contains('{') || ["cookie", "host", &fetch.auth_header.to_ascii_lowercase()].contains(&name.to_ascii_lowercase().as_str()) {
+                    bail!("[fetch] headers: '{name}' can't be set here");
+                }
             }
         }
         let mut names = BTreeSet::new();
@@ -446,6 +459,7 @@ consent = "session"    # session: Touch ID once per agent session | none
 # writes = "deny"                           # requests other than GET/HEAD: deny | ask | allow
 # auth = "Bearer {token}"                   # header value, {field} placeholders
 # auth_header = "Authorization"
+# headers = { "x-client-id" = "web" }       # fixed, non-secret headers the site expects
 
 # [[tool]]
 # name = "item"
@@ -472,6 +486,7 @@ mod tests {
         hosts = ["https://api.example.com", "http://127.0.0.1:8080"]
         writes = "ask"
         auth = "Bearer {token}"
+        headers = { "x-client-id" = "web" }
 
         [[tool]]
         name = "item"
@@ -500,6 +515,9 @@ mod tests {
             ("[fetch]\nhosts = [\"https://a.example.com\"]\n[[tool]]\nname = \"t\"\nabout = \"\"\nrequest = \"GET https://b.example.com/x\"", "isn't one of"),
             ("[fetch]\nhosts = [\"https://a.example.com\"]\n[[tool]]\nname = \"t\"\nabout = \"\"\nrequest = \"GET https://{h}.example.com/x\"", "host"),
             ("[[tool]]\nname = \"t\"\nabout = \"\"\nrequest = \"GET https://a.example.com/x\"", "[fetch]"),
+            ("[fetch]\nhosts = [\"https://a.example.com\"]\nheaders = { authorization = \"x\" }", "can't be set"),
+            ("[fetch]\nhosts = [\"https://a.example.com\"]\nheaders = { x-id = \"{token}\" }", "can't be set"),
+            ("[fetch]\nhosts = [\"https://a.example.com\"]\nheaders = { cookie = \"a=b\" }", "can't be set"),
         ];
         for (text, why) in bad {
             let err = format!("{:#}", Policy::parse(text).err().unwrap_or_else(|| panic!("accepted: {text}")));
