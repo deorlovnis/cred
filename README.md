@@ -50,6 +50,7 @@ cred set github token --expires 2027-01-31   # hidden prompt; asks for link/desc
 cred update github token                     # rotate: copy the new token, run this
 cred policy edit github                      # write the policy (template on first use)
 cred policy approve github                   # Touch ID; until then the policy has no effect
+cred policy approve                          # all policies, one Touch ID (install.sh runs this)
 cred run -s github -- gh api user            # if the policy allows: exported fields as env vars
 cred ls                                      # one row per resource — never values
 cred info github                             # fields, policy, expiry, refresh

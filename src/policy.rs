@@ -548,7 +548,8 @@ pub fn revoke(res: &str) {
     keychain::delete(res, APPROVAL);
 }
 
-pub fn approve(res: &str) -> Result<()> {
+/// Read, check and print a policy for approval; what is printed is exactly what gets pinned.
+fn prepare(res: &str) -> Result<Approval> {
     let p = path(res);
     let text = fs::read_to_string(&p).map_err(|_| anyhow!("{res} has no policy (write one with: cred policy edit {res})"))?;
     let policy = Policy::parse(&text).with_context(|| p.display().to_string())?;
@@ -560,16 +561,30 @@ pub fn approve(res: &str) -> Result<()> {
             scripts.insert(script.display().to_string(), sha256_hex(&bytes));
         }
     }
-    // What is shown is exactly what gets pinned: the text and scripts read once, above.
     let digest = sha256_hex(text.as_bytes());
     println!("Policy for {res} ({}):\n\n{}\n", p.display(), text.trim_end());
     for (script, hash) in &scripts {
         println!("pins {script} (sha256 {})", &hash[..12]);
     }
-    println!("sha256 {}", &digest[..12]);
-    approve::confirm(&format!("approve the cred policy for {res} (sha256 {})", &digest[..12]))?;
-    keychain::replace(res, APPROVAL, &serde_json::to_string(&Approval { policy: digest, scripts })?)?;
-    println!("approved the policy for {res}");
+    println!("sha256 {}\n", &digest[..12]);
+    Ok(Approval { policy: digest, scripts })
+}
+
+/// Approve the given resources' policies with one confirmation (all policies when none given).
+pub fn approve(resources: &[String]) -> Result<()> {
+    let resources = if resources.is_empty() { names() } else { resources.to_vec() };
+    if resources.is_empty() {
+        bail!("there are no policies (write one with: cred policy edit RESOURCE)");
+    }
+    let prepared: Vec<(String, Approval)> =
+        resources.iter().map(|res| Ok((res.clone(), prepare(res)?))).collect::<Result<_>>()?;
+    let list: Vec<String> = prepared.iter().map(|(res, a)| format!("{res} (sha256 {})", &a.policy[..12])).collect();
+    let what = if list.len() == 1 { "policy" } else { "policies" };
+    approve::confirm(&format!("approve the cred {what} for {}", list.join(", ")))?;
+    for (res, approval) in prepared {
+        keychain::replace(&res, APPROVAL, &serde_json::to_string(&approval)?)?;
+        println!("approved the policy for {res}");
+    }
     Ok(())
 }
 

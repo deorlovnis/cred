@@ -144,10 +144,10 @@ enum PolicyCmd {
         #[arg(value_parser = parse_resource)]
         resource: String,
     },
-    /// Approve the policy with Touch ID; until then it has no effect
+    /// Approve policies with one Touch ID (all of them if none named); until then they have no effect
     Approve {
         #[arg(value_parser = parse_resource)]
-        resource: String,
+        resources: Vec<String>,
     },
 }
 
@@ -581,7 +581,7 @@ fn main() -> ExitCode {
         Cmd::Policy { action } => ok(match action {
             PolicyCmd::Show { resource } => policy::show(&resource),
             PolicyCmd::Edit { resource } => policy::edit(&resource),
-            PolicyCmd::Approve { resource } => policy::approve(&resource),
+            PolicyCmd::Approve { resources } => policy::approve(&resources),
         }),
         Cmd::Refresh { resources, force } => cmd_refresh(resources, force),
         Cmd::Info { resource } => ok(cmd_info(&resource)),
