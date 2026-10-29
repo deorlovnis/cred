@@ -10,14 +10,38 @@ Requires macOS and Rust (`mise use -g rust@stable`, or rustup).
 
 ```sh
 git clone https://github.com/deorlovnis/cred.git ~/Git/cred
-cd ~/Git/cred
-cargo install --path . --root ~/.local   # installs ~/.local/bin/cred; add --force to replace an existing one
+~/Git/cred/install.sh        # builds, signs, installs ~/.local/bin/cred
 cred --help
 ```
 
-To update: `git pull && cargo install --path . --root ~/.local --force`.
+To update: `git pull && ./install.sh`.
 
-The first time a new build reads a secret it didn't store itself, macOS asks for Keychain access — choose **Always Allow**.
+### Signing
+
+macOS asks before an app reads a Keychain item it didn't store, and remembers **Always Allow** per app identity. A plain Rust build is ad-hoc signed, so every rebuild is a new app and asks again. Sign with a stable self-signed identity once and approvals survive updates:
+
+```sh
+cat > /tmp/cred-cert.cnf <<'CNF'
+[req]
+distinguished_name = dn
+x509_extensions = ext
+prompt = no
+[dn]
+CN = cred code signing
+[ext]
+basicConstraints = critical, CA:false
+keyUsage = critical, digitalSignature
+extendedKeyUsage = critical, codeSigning
+CNF
+cd "$(mktemp -d)"
+openssl req -new -x509 -newkey rsa:2048 -nodes -days 3650 -config /tmp/cred-cert.cnf -keyout key.pem -out cert.pem
+openssl pkcs12 -export -inkey key.pem -in cert.pem -name "cred code signing" -out cred.p12 -passout pass:tmp \
+  -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1   # algorithms the Keychain can import
+security import cred.p12 -k ~/Library/Keychains/login.keychain-db -P tmp -T /usr/bin/codesign
+rm -f key.pem cert.pem cred.p12 /tmp/cred-cert.cnf
+```
+
+`install.sh` then signs with it (identifier `com.deorlovnis.cred`). The certificate doesn't need to be trusted. Keychain prompts after this take your login password, not Touch ID: that needs an Apple Developer–signed app.
 
 ## Use
 
