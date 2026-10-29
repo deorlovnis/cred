@@ -6,19 +6,19 @@ Secrets are grouped by **resource**, one thing you sign in to (`github`, `aws`, 
 
 ## Install
 
-Requires macOS and Rust (`mise use -g rust@stable`, or rustup).
+Requires macOS, Rust (`mise use -g rust@stable`, or rustup), and Node.js for the sandboxed browser.
 
 ```sh
 git clone https://github.com/deorlovnis/cred.git ~/Git/cred
-~/Git/cred/install.sh        # builds, signs, installs /usr/local/bin/cred (root-owned)
+~/Git/cred/install.sh        # builds, signs, installs /usr/local/bin/cred and the browser runner (root-owned)
 cred --help
 ```
 
-To update: `git pull && ./install.sh`. Never install a debug build: debug builds let tests answer approval prompts.
+To update: `git pull && ./install.sh`. It ends by asking you to approve your policies again, with one Touch ID (see Signing). Never install a debug build: debug builds let tests answer approval prompts.
 
 ### Signing
 
-macOS asks before an app reads a Keychain item it didn't store, and remembers **Always Allow** per app identity. A plain Rust build is ad-hoc signed, so every rebuild counts as a new app and asks again. Sign with a stable self-signed identity once, and approvals survive updates:
+macOS asks before an app reads a Keychain item it didn't store, and remembers **Always Allow** per app identity. A plain Rust build is ad-hoc signed, so every rebuild counts as a new app and asks again. Sign with a stable self-signed identity once, and your Always Allow answers survive updates:
 
 ```sh
 cat > /tmp/cred-cert.cnf <<'CNF'
@@ -42,6 +42,8 @@ rm -f key.pem cert.pem cred.p12 /tmp/cred-cert.cnf
 ```
 
 When `codesign` asks to use the key, choose **Allow**, never **Always Allow**: a key anything can use silently lets any program running as you sign a lookalike cred that the Keychain trusts. After switching identities, run `cred reseal` so each item trusts only the new cred, then approve your policies again.
+
+Items cred writes itself, policy approvals included, stay tied to the exact build that wrote them: without an Apple Developer Team ID, macOS can't tie them to the signing identity. Approvals are read without allowing a prompt, so after an update they read as missing and every resource is blocked until you approve again. `install.sh` does that at the end. Keychain prompts take your login password; Touch ID only appears in cred's own approval prompts.
 
 ## Use
 
@@ -81,6 +83,8 @@ consent = "session"                            # Touch ID before an agent sessio
 hosts = ["https://api.example.com"]            # the only hosts cred sends credentials to
 writes = "deny"                                # requests other than GET/HEAD: deny | ask | allow
 auth = "Bearer {token}"                        # header cred adds; the agent never sees it
+auth_header = "Authorization"                  # the default
+headers = { "x-client-id" = "web" }            # fixed, non-secret headers the site expects
 
 [[tool]]
 name = "item"
@@ -90,7 +94,7 @@ request = "GET https://api.example.com/items/{id}"
 
 - `cred policy approve` prints the policy and pins its sha256, and each refresh script's, in the Keychain. If the policy or a script changes afterwards, or the approval wasn't written by cred, the resource is blocked until you approve again.
 - Refresh scripts get the fields that aren't exported (login, session) as `CRED_<FIELD>`. They run from a private copy of the approved bytes.
-- A field refreshes within an hour of expiring, or daily if its expiry is unknown. This happens before `cred run` or an agent uses it, and during `cred check`. JWT values get their exact expiry from the token.
+- A field refreshes in the last 5 minutes before its exact expiry, on its expiry date if only the date is known, or daily if its expiry is unknown. This happens before `cred run` or an agent uses it, and during `cred check`. JWT values get their exact expiry from the token.
 - `from` handles logins only a browser can do (Google sign-in, other SSO): sign in on the site in Firefox, and cred reads the session it keeps. Firefox only for now (default profile; `CRED_FIREFOX_PROFILE` overrides).
 
 ## Agents
@@ -105,6 +109,7 @@ The agent gets these tools:
 - `sites`: lists what each approved site allows.
 - `fetch(site, method, url, body)`: a request to one of the site's hosts. cred adds the credentials and doesn't follow redirects.
 - One tool per `[[tool]]` in the policies.
+- The `browse_*` tools, for sites whose policy has a `[browse]` section (see Browsing).
 
 Results are masked: the resource's values, and anything shaped like a JWT. Writes follow the policy's `writes` rule. When the policy asks for consent, a site's first use in a session needs your Touch ID.
 
@@ -124,7 +129,15 @@ cookies = [{ name = "session", field = "token", domain = ".example.com" }]
 local_storage = [{ origin = "https://app.example.com", key = "jwt", field = "token" }]
 ```
 
-Sites can be exact (`https://app.example.com`), a domain with its subdomains (`https://*.example.com`), or `"*"` for any https site. Requests to other hosts are blocked, service workers are off, and downloads are refused. The runner (`runner/`, pinned `playwright-core`) is installed root-owned by `install.sh`.
+Sites can be exact (`https://app.example.com`), a domain with its subdomains (`https://*.example.com`), or `"*"` for any https site. Requests to other hosts are blocked, service workers are off, and downloads are refused. Cookies only go to the domain the policy names. The runner (`runner/`, pinned `playwright-core`) is installed root-owned by `install.sh`; it uses Playwright's Chromium headless shell from `~/Library/Caches/ms-playwright`.
+
+A `browse_open` waits for your Touch ID when the site's first use in a session needs consent, so it can take as long as you take to answer.
+
+## What cred protects, and what it doesn't
+
+- **Protected:** values never reach the agent through cred. They stay in the Keychain, are added to requests by cred, are masked in everything cred returns, and refresh scripts run from approved bytes. Nothing loosens a policy or releases a value without Touch ID.
+- **Not protected:** whatever the agent reads (API responses, page text, screenshots) is in its context, and the agent's client may store it. Claude Code keeps tool results, screenshots included, in its session folder under `~/.claude/projects/`. Masking can't reach text inside a screenshot, so leave `screenshots` off for sites whose pages show secrets.
+- **Same-user limits:** the agent runs as you. It can't read values silently, but it can cause Keychain or Touch ID prompts. Approve only prompts you expect.
 
 ## With Claude Code
 
