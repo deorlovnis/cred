@@ -16,6 +16,7 @@ use anyhow::{Context, Result, anyhow};
 
 use super::store;
 use crate::browse::BoxBrowser;
+use crate::engine;
 use crate::{parse_resource, seal};
 
 const EXTENSION: &str = "sealed";
@@ -97,11 +98,13 @@ pub type Launch = Box<dyn Fn(&str) -> Result<(Child, String)> + Send + Sync>;
 pub struct InBox {
     sessions: Sessions,
     launch: Launch,
+    /// `[browser] downloads = true`: where in the VM pages may save files.
+    downloads: bool,
 }
 
 impl InBox {
-    pub fn new(sessions: Sessions, launch: Launch) -> Self {
-        Self { sessions, launch }
+    pub fn new(sessions: Sessions, launch: Launch, downloads: bool) -> Self {
+        Self { sessions, launch, downloads }
     }
 }
 
@@ -116,6 +119,10 @@ impl BoxBrowser for InBox {
 
     fn seal(&self, site: &str, state: &str) -> Result<()> {
         self.sessions.put(site, state)
+    }
+
+    fn downloads(&self, site: &str) -> Option<String> {
+        self.downloads.then(|| format!("{}/{site}", engine::BROWSER_DOWNLOADS))
     }
 }
 

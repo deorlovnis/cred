@@ -278,3 +278,103 @@ fn vm_has_only_the_door() {
     drop(door);
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// The browser VM: its image builds, it has only the door, the runner starts in it as an
+/// unprivileged user, and Chromium's trust store takes the box CA.
+#[test]
+#[ignore = "needs Apple's `container`; run with `mise run e2e-box`"]
+fn browser_vm_has_only_the_door_and_runs_the_runner() {
+    if env::var_os("CRED_E2E_BOX").is_none() {
+        eprintln!("CRED_E2E_BOX isn't set: skipping");
+        return;
+    }
+    engine::available().unwrap();
+
+    let built = Instant::now();
+    let image = engine::build_browser_image(&Path::new(env!("CARGO_MANIFEST_DIR")).join("box")).unwrap();
+    println!("browser image built in {:?}: {image}", built.elapsed());
+    assert!(image.starts_with("cred-browser@sha256:"), "{image}");
+    assert_eq!(engine::image_digest(engine::BROWSER_IMAGE).unwrap(), image);
+
+    let dir = PathBuf::from(format!("/tmp/cred-e2e-browser-{}", process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    let name = engine::browser_vm_name(&format!("e2e-{}", process::id()));
+    let spec = engine::BrowserSpec {
+        name: name.clone(),
+        image,
+        socket: dir.join("door.sock"),
+        // not there yet: run_browser makes it
+        downloads: Some(dir.join("downloads")),
+    };
+    let door = TestDoor::start(&spec.socket);
+    let vm = Vm(name.clone());
+    let started = Instant::now();
+    engine::run_browser(&spec).unwrap();
+    assert!(engine::running(&name));
+    let env = [("HOME".to_string(), "/home/browser".to_string())];
+    assert!(sh(&name, &env, "true").0);
+    println!("browser VM running after {:?}", started.elapsed());
+
+    // as the browser's user; no network; no setuid programs; nothing writable but /tmp, its home
+    // and the downloads
+    assert_eq!(sh(&name, &env, "id -un; id -u").1, "browser\n1000");
+    assert_eq!(sh(&name, &[], "ls /sys/class/net").1, "lo");
+    assert_eq!(sh(&name, &[], "find / -xdev -perm /6000 -type f 2>/dev/null").1, "");
+    let (_, writable) = sh(
+        &name,
+        &[],
+        "find / -xdev \\( -path /proc -o -path /sys -o -path /dev -o -path /tmp -o -path /var/tmp -o -path /home/browser -o -path /downloads \\) -prune -o -writable ! -type l ! -path /run/cred/local.sock -print 2>/dev/null",
+    );
+    assert_eq!(writable, "", "the browser's user can write on the root filesystem");
+    let (ok, out) = sh(&name, &[], "node --version");
+    assert!(ok && out.starts_with("v22."), "{out}");
+    let connect = r#"node -e "require('net').connect('/run/cred/door.sock').on('error', (e) => { console.log(e.code); process.exit(1) })""#;
+    let (ok, out) = sh(&name, &[], connect);
+    assert!(!ok && out.contains("EACCES"), "only root may dial the door socket: {out}");
+
+    // the downloads folder is shared with the Mac, writable from the VM
+    let (ok, out) = sh(&name, &env, "echo saved > /downloads/file.txt");
+    assert!(ok, "{out}");
+    assert_eq!(fs::read_to_string(dir.join("downloads/file.txt")).unwrap(), "saved\n");
+
+    // the box CA goes where Chromium looks, and only there
+    let ca_pem = test_ca_pem();
+    let ca = engine::install_browser_ca(&name, &ca_pem);
+    assert!(ca.is_ok(), "{ca:?}");
+    let (ok, out) = sh(&name, &env, "certutil -L -d sql:$HOME/.pki/nssdb");
+    assert!(ok && out.contains("cred-box") && out.contains("C,,"), "{out}");
+    // repeatable
+    engine::install_browser_ca(&name, &ca_pem).unwrap();
+
+    // the runner starts as the browser's user and answers its protocol on stdout
+    let mut runner = engine::exec_runner(&name, &[]).unwrap();
+    let mut stdin = runner.stdin.take().unwrap();
+    let mut stdout = BufReader::new(runner.stdout.take().unwrap());
+    stdin.write_all(b"{\"id\":1,\"cmd\":\"nonsense\"}\n").unwrap();
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line.trim(), "{\"id\":1,\"ok\":false,\"error\":\"unknown command nonsense\"}");
+    drop(stdin); // the runner ends when its stdin does
+    assert!(runner.wait().unwrap().success());
+
+    // the proxy listener reaches the door
+    let connect = r#"node -e "const s = require('net').connect(3128, '127.0.0.1'); s.write('CONNECT example.com:443 HTTP/1.1\r\n\r\n'); s.on('data', (d) => { console.log(String(d).split('\r')[0]); process.exit(0) })""#;
+    let (_, out) = sh(&name, &env, connect);
+    assert_eq!(out, "HTTP/1.1 403 Forbidden", "the test door refuses");
+    assert!(door.saw("proxy", "CONNECT example.com:443"));
+
+    drop(vm);
+    assert!(!engine::running(&name));
+    assert!(!spec.socket.exists());
+    drop(door);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A CA certificate (PEM) to install; nothing signs with it.
+fn test_ca_pem() -> String {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.self_signed(&key).unwrap().pem()
+}

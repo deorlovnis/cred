@@ -87,6 +87,19 @@ impl Layout {
         self.sockets.join(format!("{id}.sock"))
     }
 
+    /// The socket of the box's browser VM, next to the agent's.
+    #[allow(dead_code)] // for the browser VM of box runs
+    pub fn browser_socket(&self, id: &str) -> PathBuf {
+        self.sockets.join(format!("{id}-browser.sock"))
+    }
+
+    /// Where the box's browser VM saves downloads, one folder per site: outside every store, and
+    /// mounted into the browser VM only (~/Library/Application Support/cred/downloads/<box>).
+    #[allow(dead_code)] // for the browser VM of box runs
+    pub fn downloads(&self, name: &str) -> PathBuf {
+        self.root.parent().unwrap_or(&self.root).join("downloads").join(name)
+    }
+
     /// Create the folders a run needs, private to the user.
     pub fn prepare(&self) -> Result<()> {
         for dir in [&self.root, &self.open_dir(), &self.root.join("temp"), &self.sockets] {

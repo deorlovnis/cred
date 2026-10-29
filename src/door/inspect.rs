@@ -19,6 +19,10 @@
 //!   other hosts are not masked: there is nothing to mask them against.
 //! - **The Host header** must be the host the guest connected to, or a guest could tunnel to
 //!   one allowed host and ask for another.
+//! - **Pages.** A request from a page in the box's browser VM (see `page`) is judged by its
+//!   site's `[browse]` rules, not the box's: `writes` and `allow_writes` instead of `[net]`.
+//!   No credentials are added to it, and its answer is not masked here (cred masks what the
+//!   runner reports): the session is in the browser already.
 //! - **The log:** one chained line per request, with the method and the masked URL, never
 //!   headers or bodies.
 //!
@@ -32,7 +36,7 @@ use url::Url;
 use super::addr::split_target;
 use super::gateway::HOP_BY_HOP;
 use super::http::{self, Body, Framing, Head};
-use super::{Entry, Shared};
+use super::{Entry, Shared, page};
 use crate::audit::mask_url;
 use crate::index::Index;
 use crate::mask::{Masker, Stream};
@@ -53,12 +57,30 @@ pub struct Net {
     pub allow_writes: Vec<String>,
 }
 
+/// Whose connection it is.
+pub(super) enum Caller {
+    /// The agent's VM: the box's `[net]`, and the credentials of the sites it has.
+    Agent,
+    /// A page of this site, in the browser VM.
+    Page(String),
+}
+
+impl Caller {
+    pub fn site(&self) -> Option<&str> {
+        match self {
+            Caller::Agent => None,
+            Caller::Page(site) => Some(site),
+        }
+    }
+}
+
 /// What `serve` needs to know about the connection.
 pub(super) struct Ctx<'a> {
     /// The door: its box, its sites, its log.
     pub shared: &'a Shared,
     /// The host the guest asked to be connected to (as `addr::split_target` gives it).
     pub host: &'a str,
+    pub caller: &'a Caller,
 }
 
 /// A request body this small is kept while it is sent, so the request can be sent again if the
@@ -240,23 +262,35 @@ fn refusal(status: u16, decision: &'static str, message: impl Into<String>) -> R
     Refusal { status, decision, message: message.into() }
 }
 
+/// Whose rules decide about writes.
+enum Rules<'a> {
+    /// The box's `[net]`, for the agent's requests to hosts no site covers.
+    Net,
+    /// A site's `[fetch]`, for the agent's requests to the site's hosts.
+    Fetch(&'a Site),
+    /// A site's `[browse]`, for its pages.
+    Page(&'a page::Rules),
+}
+
 /// What the request does at this host: `allowed`, or `asked:yes` after Touch ID, or why not.
-fn decide(sh: &Shared, kind: Kind, site: Option<&Site>, method: &str, host: &str, target: &str, url: &str) -> Result<&'static str, Refusal> {
+fn decide(sh: &Shared, kind: Kind, rules: &Rules, method: &str, host: &str, target: &str, url: &str) -> Result<&'static str, Refusal> {
     if kind == Kind::Read {
         return Ok("allowed");
     }
     // A site rules its own hosts; the box's exceptions are for the rest.
-    let mode = match site {
-        Some(site) => site.writes,
-        None if under_prefix(&sh.cfg.net.allow_writes, host, target) => Mode::Allow,
-        None => sh.cfg.net.writes,
-    };
-    let who = site.map_or_else(|| format!("the policy of box {}", sh.cfg.name), |s| format!("the policy for {}", s.name));
-    match (mode, kind) {
-        (Mode::Deny, _) => {
-            let hint = if site.is_some() { "" } else { " ([net] writes, allow_writes)" };
-            Err(refusal(403, "blocked:writes", format!("{who} doesn't allow {method} requests here{hint}")))
+    let (mode, who, hint) = match rules {
+        Rules::Fetch(site) => (site.writes, format!("the policy for {}", site.name), ""),
+        Rules::Page(page) => {
+            let mode = if under_prefix(&page.allow_writes, host, target) { Mode::Allow } else { page.writes };
+            (mode, format!("the [browse] policy for {}", page.site), "")
         }
+        Rules::Net => {
+            let mode = if under_prefix(&sh.cfg.net.allow_writes, host, target) { Mode::Allow } else { sh.cfg.net.writes };
+            (mode, format!("the policy of box {}", sh.cfg.name), " ([net] writes, allow_writes)")
+        }
+    };
+    match (mode, kind) {
+        (Mode::Deny, _) => Err(refusal(403, "blocked:writes", format!("{who} doesn't allow {method} requests here{hint}"))),
         (_, Kind::Upgrade) => Err(refusal(501, "blocked:upgrade", "the door can't carry an upgraded connection (WebSocket) yet")),
         (Mode::Ask, _) => match approve::confirm(&format!("let box {} send {method} {url}", sh.cfg.name)) {
             Ok(()) => Ok("asked:yes"),
@@ -279,6 +313,7 @@ fn exchange<G: Read + Write, U: Read + Write>(
     // The log line has this request's bytes, not the connection's so far.
     let before = (counts.up, counts.down);
     let entry = |method: &str, url: &str, status: Option<u16>, decision: &str, counts: &Counts| Entry {
+        site: ctx.caller.site().map(String::from),
         host: Some(ctx.host.to_string()),
         method: Some(method.to_string()),
         url: Some(url.to_string()),
@@ -309,7 +344,20 @@ fn exchange<G: Read + Write, U: Read + Write>(
         return end_with(sh, guest, entry(&method_shown, &url, Some(421), "blocked:host-mismatch", counts), &message);
     }
 
-    let site = match site_for(sh, ctx.host) {
+    // A page has the site's browser rules and no credentials added; the agent has the credentials
+    // of the site that covers the host, or the box's rules.
+    let page_rules = match ctx.caller {
+        Caller::Page(name) => match page::rules(name) {
+            Ok(rules) => Some(rules),
+            Err(e) => {
+                let url = mask_url(&full_url(ctx.host, target), &plain);
+                sh.log.write(&entry(&method_shown, &url, Some(403), "blocked:policy", counts));
+                return end_with_message(guest, 403, &format!("{e:#}"));
+            }
+        },
+        Caller::Agent => None,
+    };
+    let site = match page_rules.as_ref().map_or_else(|| site_for(sh, ctx.host), |_| Ok(None)) {
         Ok(site) => site,
         Err(e) => {
             let url = mask_url(&full_url(ctx.host, target), &plain);
@@ -322,7 +370,12 @@ fn exchange<G: Read + Write, U: Read + Write>(
     let keep = head.keep_alive();
 
     let kind = classify(&head, method, target);
-    let decision = match decide(sh, kind, site.as_ref(), &method_shown, ctx.host, target, &url) {
+    let rules = match (&page_rules, &site) {
+        (Some(page), _) => Rules::Page(page),
+        (None, Some(site)) => Rules::Fetch(site),
+        (None, None) => Rules::Net,
+    };
+    let decision = match decide(sh, kind, &rules, &method_shown, ctx.host, target, &url) {
         Ok(decision) => decision,
         Err(r) => {
             sh.log.write(&entry(&method_shown, &url, Some(r.status), r.decision, counts));

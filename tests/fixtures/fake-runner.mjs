@@ -25,11 +25,18 @@ const signedIn = (start) => {
   };
 };
 
+// The session the browser starts with: a sealed one (`storageState`), else the fields' cookies.
+const cookies = () => config.storageState?.cookies ?? config.cookies;
+const storage = () => [
+  ...config.storage,
+  ...(config.storageState?.origins ?? []).flatMap((o) => o.localStorage.map((e) => ({ key: e.name, value: e.value }))),
+];
+
 const page = () =>
   [
     'URL: fake',
-    `cookies: ${config.cookies.map((c) => `${c.name}=${c.value}`).join('; ')}`,
-    `storage: ${config.storage.map((e) => `${e.key}=${e.value}`).join('; ')}`,
+    `cookies: ${cookies().map((c) => `${c.name}=${c.value}`).join('; ')}`,
+    `storage: ${storage().map((e) => `${e.key}=${e.value}`).join('; ')}`,
     `proxy: ${JSON.stringify(config.proxy ?? null)}`,
   ].join('\n');
 
@@ -52,7 +59,7 @@ rl.on('line', (line) => {
   } else if (msg.cmd === 'close') {
     const storageState = config.login
       ? signedIn(config.start)
-      : { cookies: config.cookies.map((c) => ({ ...c, value: step(c.value) })), origins: [] };
+      : { cookies: cookies().map((c) => ({ ...c, value: step(c.value) })), origins: config.storageState?.origins ?? [] };
     send({ id: msg.id, ok: true, text: JSON.stringify({ storageState }) });
     process.exit(0);
   } else {

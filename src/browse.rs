@@ -41,13 +41,16 @@ fn runner_dir() -> PathBuf {
 /// sealed. `cred mcp` outside a box has none and runs the browser on the Mac.
 pub trait BoxBrowser: Send + Sync {
     /// Start a runner for the site in the box's browser VM (starting the VM if it isn't up),
-    /// with the token the door will accept from it as that site.
+    /// with the token the door will accept from it as that site (empty: this runner has no proxy,
+    /// as when tests run it on the Mac).
     fn runner(&self, site: &str) -> Result<(Child, String)>;
     /// The site's sealed session (a Playwright `storageState`, as JSON). `Ok(None)`: there is none,
     /// or the box doesn't keep sessions. `Err`: there is one and it doesn't open.
     fn sealed(&self, site: &str) -> Result<Option<String>>;
     /// Replace the site's sealed session. Does nothing if the box doesn't keep sessions.
     fn seal(&self, site: &str, state: &str) -> Result<()>;
+    /// Where in the browser VM the site's pages may save downloads, if the box allows downloads.
+    fn downloads(&self, site: &str) -> Option<String>;
 }
 
 /// Where Chromium's traffic goes inside the browser VM: the shim's proxy.
@@ -83,15 +86,26 @@ impl Session {
     /// Start a browser on the Mac for the site with its session in place (the Keychain fields
     /// its policy names), and open the start page.
     pub fn open(site: &str, approved: &Approved) -> Result<(Self, String)> {
-        Self::open_with(site, approved, mac_runner()?, None, None)
+        Self::open_with(site, approved, mac_runner()?, None, None, None)
     }
 
     /// The same over any runner process: `sealed` is the session to start from instead of the
-    /// Keychain fields, `proxy` the (username, password) Chromium presents to the proxy in a box.
-    pub fn open_with(site: &str, approved: &Approved, mut child: Child, sealed: Option<&Value>, proxy: Option<(&str, &str)>) -> Result<(Self, String)> {
-        let mut config = config(site, &approved.policy, sealed)?;
-        if let Some((user, password)) = proxy {
+    /// Keychain fields, `proxy` the (username, password) Chromium presents to the proxy in a box,
+    /// `downloads` the folder pages may save to (none: downloads are refused).
+    pub fn open_with(
+        site: &str,
+        approved: &Approved,
+        mut child: Child,
+        sealed: Option<&Value>,
+        proxy: Option<(&str, &str)>,
+        downloads: Option<String>,
+    ) -> Result<(Self, String)> {
+        let mut config = config(site, &approved.policy, sealed.map_or(Source::Fields, Source::Sealed))?;
+        if let Some((user, password)) = proxy.filter(|(_, password)| !password.is_empty()) {
             config["proxy"] = json!({ "server": BOX_PROXY, "username": user, "password": password });
+        }
+        if let Some(folder) = downloads {
+            config["downloads"] = json!(folder);
         }
         let stdin = child.stdin.take().expect("piped");
         let stdout = BufReader::new(child.stdout.take().expect("piped"));
@@ -155,21 +169,21 @@ fn closed_state(reply: &Value) -> Option<Value> {
 }
 
 /// What the runner needs to open a site: its rules and the session to start with.
-fn config(site: &str, policy: &Policy, sealed: Option<&Value>) -> Result<Value> {
+fn config(site: &str, policy: &Policy, source: Source) -> Result<Value> {
     let browse = policy
         .browse
         .as_ref()
         .ok_or_else(|| anyhow!("the policy for {site} doesn't allow browsing (no [browse] section)"))?;
-    let (cookies, storage) = match sealed {
-        Some(state) => state_parts(state),
-        None => field_parts(site, browse)?,
+    let (cookies, storage) = match source {
+        Source::Fields => field_parts(site, browse)?,
+        Source::Sealed(_) | Source::Fresh => (Vec::new(), Vec::new()),
     };
     let writes = match browse.writes {
         Mode::Allow => "allow",
         Mode::Ask => "ask",
         Mode::Deny => "deny",
     };
-    Ok(json!({
+    let mut config = json!({
         "origins": browse.origins(),
         "requests": browse.requests(),
         "writes": writes,
@@ -178,7 +192,23 @@ fn config(site: &str, policy: &Policy, sealed: Option<&Value>) -> Result<Value> 
         "cookies": cookies,
         "storage": storage,
         "screenshots": browse.screenshots,
-    }))
+    });
+    if let Source::Sealed(state) = source {
+        // Playwright puts cookies and Local Storage back as it took them.
+        config["storageState"] = state.clone();
+    }
+    Ok(config)
+}
+
+/// Where a browser's session comes from.
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    /// The cookies and Local Storage entries the policy builds from the site's stored fields.
+    Fields,
+    /// A `storageState` an earlier browser ended with.
+    Sealed(&'a Value),
+    /// An empty profile: a person signs in.
+    Fresh,
 }
 
 /// The cookies and Local Storage entries the policy builds from the site's stored fields.
@@ -250,7 +280,7 @@ pub enum Stop {
 /// window if `headed`. Ends when the window is closed, or when `stop` (asked every 100 ms) says
 /// so. Returns the session, or `None` if the person skipped or the runner gave none.
 pub fn sign_in(site: &str, policy: &Policy, start: &str, mut child: Child, headed: bool, mut stop: impl FnMut() -> Option<Stop>) -> Result<Option<Value>> {
-    let mut config = config(site, policy, Some(&json!({})))?;
+    let mut config = config(site, policy, Source::Fresh)?;
     config["start"] = json!(start);
     config["login"] = json!(true);
     config["headed"] = json!(headed);

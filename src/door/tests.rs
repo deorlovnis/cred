@@ -322,7 +322,10 @@ fn scenario(dir: &Path) {
             net: Default::default(),
             log: log_path.clone(),
             ca: None,
-            log_key: LOG_KEY, browser: None,
+            log_key: LOG_KEY,
+            browser_socket: None,
+            browser_tokens: Default::default(),
+            browser: None,
         },
         net,
     )
@@ -506,7 +509,7 @@ fn model_refusals(dir: &Path) {
         let socket = dir.join("second.sock");
         let _ = fs::remove_file(&socket);
         let guest = Guest::new(&socket);
-        let config = Config { name: "second".into(), socket, allow: vec![], model: model.map(String::from), sites: vec![], net: Default::default(), log: dir.join("second.log"), log_key: LOG_KEY, browser: None, ca: None };
+        let config = Config { name: "second".into(), socket, allow: vec![], model: model.map(String::from), sites: vec![], net: Default::default(), log: dir.join("second.log"), log_key: LOG_KEY, ca: None, browser_socket: None, browser_tokens: Default::default(), browser: None };
         let door = Door::start_with(config, Net::system()).unwrap();
         let mut conn = guest.connection("cred");
         conn.send(&post("/model/v1/messages", &[("x-api-key", "cred-managed")], "{}"));
@@ -570,7 +573,7 @@ fn live_door() {
     let allow = std::env::var("CRED_DOOR_ALLOW").unwrap_or_default().split(',').filter(|s| !s.is_empty()).map(String::from).collect();
     let seconds = std::env::var("CRED_DOOR_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
     let log = std::env::temp_dir().join(format!("cred-door-live-{}.log", std::process::id()));
-    let door = Door::start(Config { name: "live".into(), socket: socket.into(), allow, model: None, sites: vec![], net: Default::default(), log: log.clone(), log_key: LOG_KEY, browser: None, ca: None }).unwrap();
+    let door = Door::start(Config { name: "live".into(), socket: socket.into(), allow, model: None, sites: vec![], net: Default::default(), log: log.clone(), log_key: LOG_KEY, ca: None, browser_socket: None, browser_tokens: Default::default(), browser: None }).unwrap();
     eprintln!("door log: {}", log.display());
     thread::sleep(Duration::from_secs(seconds));
     door.stop();
@@ -589,7 +592,10 @@ fn bad_allow_patterns_stop_the_door_from_starting() {
         net: Default::default(),
         log: dir.0.join("log"),
         ca: None,
-        log_key: LOG_KEY, browser: None,
+        log_key: LOG_KEY,
+        browser_socket: None,
+        browser_tokens: Default::default(),
+        browser: None,
     };
     let err = Door::start(cfg).err().expect("should fail");
     assert!(format!("{err:#}").contains("example.com"), "{err:#}");

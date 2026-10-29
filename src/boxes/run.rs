@@ -24,7 +24,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
-use super::sessions::{InBox, Sessions};
+use super::browser_vm::BrowserVm;
+use super::sessions::{InBox, Launch, Sessions};
 use super::store::{self, Layout};
 use super::{BoxPolicy, MountPolicy, mount_problem};
 use crate::chain::{self, Chain};
@@ -53,6 +54,8 @@ pub trait World: Sync {
     /// After the agent's command ended and before any VM stops: let the door finish what the end
     /// of the agent's connections sets off (browsers closing, their sessions sealed).
     fn settle(&self, _door: &dyn Any) {}
+    /// The pinned reference of the browser image; fails if it isn't built.
+    fn browser_image(&self) -> Result<String>;
     /// Make the box's CA trusted inside the VM (as root, before the agent starts).
     fn install_ca(&self, vm: &str, pem: &str) -> Result<()>;
     fn model_uses_bearer(&self, model: &str) -> Result<bool>;
@@ -101,6 +104,10 @@ impl World for Real {
         if let Some(door) = door.downcast_ref::<door::Door>() {
             door.wait_idle(SETTLE);
         }
+    }
+
+    fn browser_image(&self) -> Result<String> {
+        engine::image_digest(engine::BROWSER_IMAGE)
     }
 
     fn install_ca(&self, vm: &str, pem: &str) -> Result<()> {
@@ -248,6 +255,24 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
 
     let socket = layout.socket(&req.id);
     let _ = fs::remove_file(&socket);
+
+    // The browser VM is made for the box's sites but started by the first runner that asks.
+    let browser_socket = layout.browser_socket(&req.id);
+    let _ = fs::remove_file(&browser_socket);
+    let tokens = door::Tokens::default();
+    let (browser_vm, launch): (Option<Arc<BrowserVm>>, Launch) = match (!policy.sites.is_empty()).then(|| world.browser_image()) {
+        Some(Ok(image)) => {
+            let downloads = policy.browser.downloads.then(|| layout.downloads(req.name));
+            let vm = Arc::new(BrowserVm::new(&req.id, &image, browser_socket.clone(), downloads, ca.cert_pem(), tokens.clone()));
+            let runners = vm.clone();
+            (Some(vm), Box::new(move |site| runners.runner(site)))
+        }
+        Some(Err(e)) => {
+            let why = format!("{e:#}");
+            (None, Box::new(move |_| bail!("the browser VM isn't available: {why}")))
+        }
+        None => (None, Box::new(|_| bail!("this box has no sites to browse"))),
+    };
     let spec = engine::VmSpec {
         name: vm.clone(),
         image: image.to_string(),
@@ -267,12 +292,16 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
         log: store::door_log(&mnt),
         ca: Some(ca.clone()),
         log_key,
-        browser: Some(Arc::new(InBox::new(sessions, Box::new(browser_runner)))),
+        browser: Some(Arc::new(InBox::new(sessions, launch, policy.browser.downloads))),
+        browser_socket: browser_vm.as_ref().map(|_| browser_socket),
+        browser_tokens: tokens,
     };
 
     // Declared in the order they start, so they drop in the order they must end: VM, door, store.
     let door: Box<dyn Any>;
     let vm_guard = VmGuard { world, vm: &vm, socket: &socket };
+    // Dropped first of the three: the browser VM and its runners go before the agent's VM.
+    let _browser_guard = BrowserGuard(browser_vm.clone());
     world.start_vm(&spec)?;
     door = world.start_door(config)?;
     world.install_ca(&vm, &ca.cert_pem())?;
@@ -312,12 +341,6 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
     exit_code(status?)
 }
 
-// STUB: replaced at merge by the box's browser VM (start it with the first call, `engine::exec_runner`,
-// and give the door the token it accepts from this site's runner).
-fn browser_runner(_site: &str) -> Result<(std::process::Child, String)> {
-    bail!("the browser VM isn't available yet")
-}
-
 /// Note where the log's chain stands, so `cred box log --verify` can tell a log whose chain was
 /// stripped or whose end was cut off. A log whose chain is already broken keeps the head it had.
 fn record_head(world: &dyn World, name: &str, mnt: &Path, log_key: [u8; 32]) {
@@ -330,6 +353,17 @@ fn record_head(world: &dyn World, name: &str, mnt: &Path, log_key: [u8; 32]) {
             }
         }
         Err(e) => eprintln!("cred: the log of box {name}: {e:#}"),
+    }
+}
+
+/// The browser VM (if it was started) stops when this is dropped.
+struct BrowserGuard(Option<Arc<BrowserVm>>);
+
+impl Drop for BrowserGuard {
+    fn drop(&mut self) {
+        if let Some(vm) = &self.0 {
+            vm.stop();
+        }
     }
 }
 
@@ -607,6 +641,10 @@ mod tests {
             seen.door = Some((cfg.allow, cfg.model, cfg.sites, cfg.log));
             seen.browser = cfg.browser;
             Ok(Box::new(()))
+        }
+
+        fn browser_image(&self) -> Result<String> {
+            Ok("cred-browser@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into())
         }
 
         fn install_ca(&self, _vm: &str, pem: &str) -> Result<()> {

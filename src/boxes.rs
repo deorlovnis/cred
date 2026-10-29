@@ -13,6 +13,7 @@
 //! site's browser session is kept between runs: sealed in the store's `browser/` folder, which no
 //! VM mounts (see `sessions`; `cred box login` signs in by hand, see `login`).
 
+pub mod browser_vm;
 mod login;
 mod run;
 pub(crate) mod sessions;
@@ -130,7 +131,6 @@ pub struct BrowserPolicy {
     #[serde(default = "default_keep")]
     pub keep_sessions: bool,
     /// Pages may download files; they are saved on the Mac outside the box, never in it.
-    #[allow(dead_code)] // read where the browser VM gets its downloads folder
     #[serde(default)]
     pub downloads: bool,
 }

@@ -104,34 +104,37 @@ struct Rig {
     tokens: Arc<Mutex<Vec<String>>>,
     launch: Arc<dyn Fn() -> Child + Send + Sync>,
     keep: bool,
+    /// Whether runners get a proxy token (false: the real runner on the Mac, which has no proxy).
+    proxied: bool,
     dir: PathBuf,
 }
 
 impl Rig {
-    fn new(dir: &Path, keep: bool, launch: impl Fn() -> Child + Send + Sync + 'static) -> Self {
+    fn new(dir: &Path, keep: bool, proxied: bool, launch: impl Fn() -> Child + Send + Sync + 'static) -> Self {
         let store = dir.join("store");
-        Self { sessions: Sessions::new(&store, "the box key", keep), tokens: Arc::default(), launch: Arc::new(launch), keep, dir: store }
+        Self { sessions: Sessions::new(&store, "the box key", keep), tokens: Arc::default(), launch: Arc::new(launch), keep, proxied, dir: store }
     }
 
     fn fake(dir: &Path, keep: bool) -> Self {
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-runner.mjs");
-        Self::new(dir, keep, move || {
+        Self::new(dir, keep, true, move || {
             Command::new("node").arg(&script).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap()
         })
     }
 
     fn browser(&self) -> Arc<dyn BoxBrowser> {
-        let (tokens, launch) = (self.tokens.clone(), self.launch.clone());
+        let (tokens, launch, proxied) = (self.tokens.clone(), self.launch.clone(), self.proxied);
         // The same sealed folder, as a new object each time: a restart of the box.
         let sessions = Sessions::new(&self.dir, "the box key", self.keep);
         Arc::new(InBox::new(
             sessions,
             Box::new(move |site| {
                 let mut tokens = tokens.lock().unwrap();
-                let token = format!("token-{site}-{}", tokens.len() + 1);
-                tokens.push(token);
-                Ok((launch(), tokens.last().unwrap().clone()))
+                let token = if proxied { format!("token-{site}-{}", tokens.len() + 1) } else { String::new() };
+                tokens.push(token.clone());
+                Ok((launch(), token))
             }),
+            false,
         ))
     }
 
@@ -160,7 +163,7 @@ fn close(server: &mut Server) {
 fn started_with(dir: &Path, n: usize) -> Value {
     let log = fs::read_to_string(dir.join("runner.log")).unwrap();
     let config: Value = serde_json::from_str(log.lines().nth(n).unwrap()).unwrap();
-    config["cookies"][0]["value"].clone()
+    config["storageState"]["cookies"][0]["value"].as_str().map_or_else(|| config["cookies"][0]["value"].clone(), |v| json!(v))
 }
 
 fn sealed_cookie(rig: &Rig) -> Option<String> {
@@ -307,7 +310,7 @@ fn real_scenario(dir: &Path) {
     write_site(dir, &format!("http://127.0.0.1:{port}"), "");
     // The initial field is what the first visit brings.
     keychain::set("app", "token", "rot0").unwrap();
-    let rig = Rig::new(dir, true, || crate::browse::mac_runner().unwrap());
+    let rig = Rig::new(dir, true, false, || crate::browse::mac_runner().unwrap());
 
     let mut server = rig.server();
     open(&mut server);

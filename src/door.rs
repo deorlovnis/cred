@@ -10,6 +10,10 @@
 //!   the real key (see `gateway`);
 //! - `mcp`: cred's MCP server for the box, limited to its sites.
 //!
+//! The box's browser VM has a socket of its own, and only `proxy` connections through it are
+//! served. They are not the agent's: each one says which site's page it carries (a runner's
+//! identity, see `page`), and gets that site's `[browse]` rules instead of the box's `[net]`.
+//!
 //! Every decision is logged as a JSON line: time, kind, host or path, bytes, decision. Never
 //! values or headers. Each line is chained to the one before with an HMAC (see `chain`), so an
 //! edited or removed line shows; requests inside a connection the door has opened up are judged
@@ -19,6 +23,7 @@ mod addr;
 mod gateway;
 mod http;
 pub mod inspect;
+mod page;
 mod proxy;
 mod tls;
 
@@ -42,6 +47,7 @@ use crate::chain::Chain;
 use crate::mcp::{self, Scope};
 use crate::policy;
 use addr::{Allow, Net};
+pub use page::Tokens;
 pub use tls::{BoxCa, PURPOSE as CA_PURPOSE};
 
 /// What the box holds in place of the model key. Worthless anywhere but at the gateway.
@@ -79,12 +85,25 @@ pub struct Config {
     pub log_key: [u8; 32],
     /// The box's browser VM and sealed sessions, for the browser tools over `mcp`.
     pub browser: Option<Arc<dyn BoxBrowser>>,
+    /// The published socket of the box's browser VM, if it has one. The door dials it like the
+    /// agent's, but serves only `proxy` connections, as the site each one names.
+    pub browser_socket: Option<PathBuf>,
+    /// Which runner speaks for which site; the browser side fills it (see `Tokens`).
+    pub browser_tokens: Tokens,
+}
+
+/// Which VM's socket a connection came in on. The only thing that tells them apart: nothing a
+/// guest sends can make a connection of the agent's VM a browser's.
+#[derive(Clone, Copy, PartialEq)]
+enum Origin {
+    Agent,
+    Browser,
 }
 
 /// A running door. Dropping it stops it.
 pub struct Door {
     shared: Arc<Shared>,
-    dialer: Option<JoinHandle<()>>,
+    dialers: Vec<JoinHandle<()>>,
 }
 
 impl Door {
@@ -94,9 +113,14 @@ impl Door {
 
     fn start_with(cfg: Config, net: Net) -> Result<Door> {
         let shared = Arc::new(Shared::new(cfg, net)?);
-        let sh = shared.clone();
-        let dialer = thread::Builder::new().name("door-dialer".into()).spawn(move || dial_loop(&sh))?;
-        Ok(Door { shared, dialer: Some(dialer) })
+        let mut sockets = vec![(shared.cfg.socket.clone(), Origin::Agent, "door-dialer")];
+        sockets.extend(shared.cfg.browser_socket.clone().map(|socket| (socket, Origin::Browser, "door-dialer-browser")));
+        let mut dialers = Vec::new();
+        for (socket, origin, name) in sockets {
+            let sh = shared.clone();
+            dialers.push(thread::Builder::new().name(name.into()).spawn(move || dial_loop(&sh, &socket, origin))?);
+        }
+        Ok(Door { shared, dialers })
     }
 
     /// Wait (up to `limit`) until no connection is in use. The agent's end of an MCP connection
@@ -119,7 +143,7 @@ impl Drop for Door {
         for stream in self.shared.conns.lock().unwrap_or_else(|e| e.into_inner()).values() {
             let _ = stream.shutdown(Shutdown::Both);
         }
-        if let Some(dialer) = self.dialer.take() {
+        for dialer in self.dialers.drain(..) {
             let _ = dialer.join();
         }
     }
@@ -170,9 +194,9 @@ impl Shared {
 
     /// Dial the socket, trying again until it answers (the box may still be starting) or the
     /// door stops.
-    fn dial(&self) -> Option<UnixStream> {
+    fn dial(&self, socket: &Path) -> Option<UnixStream> {
         while !self.stopped() {
-            match UnixStream::connect(&self.cfg.socket) {
+            match UnixStream::connect(socket) {
                 Ok(stream) => return Some(stream),
                 Err(_) => thread::sleep(REDIAL),
             }
@@ -191,8 +215,8 @@ impl Shared {
     }
 }
 
-/// Keep `POOL` connections dialed in, replacing each as the guest takes it.
-fn dial_loop(sh: &Arc<Shared>) {
+/// Keep `POOL` connections dialed in to `socket`, replacing each as the guest takes it.
+fn dial_loop(sh: &Arc<Shared>, socket: &Path, origin: Origin) {
     let (taken, replace) = mpsc::channel::<()>();
     for _ in 0..POOL {
         let _ = taken.send(());
@@ -206,14 +230,14 @@ fn dial_loop(sh: &Arc<Shared>) {
         while sh.active.load(Ordering::SeqCst) >= MAX_ACTIVE && !sh.stopped() {
             thread::sleep(REDIAL);
         }
-        let Some(stream) = sh.dial() else { break };
+        let Some(stream) = sh.dial(socket) else { break };
         let (sh, taken) = (sh.clone(), taken.clone());
-        let _ = thread::Builder::new().name("door-conn".into()).spawn(move || connection(&sh, stream, taken));
+        let _ = thread::Builder::new().name("door-conn".into()).spawn(move || connection(&sh, stream, taken, origin));
     }
 }
 
 /// One dialed connection: idle until the guest writes to it, then served until either side closes.
-fn connection(sh: &Shared, stream: UnixStream, taken: Sender<()>) {
+fn connection(sh: &Shared, stream: UnixStream, taken: Sender<()>, origin: Origin) {
     let id = sh.register(&stream);
     let mut reader = match stream.try_clone() {
         Ok(clone) => BufReader::new(clone),
@@ -228,7 +252,7 @@ fn connection(sh: &Shared, stream: UnixStream, taken: Sender<()>) {
     let _ = taken.send(());
     if wanted {
         sh.active.fetch_add(1, Ordering::SeqCst);
-        serve(sh, reader, stream.try_clone().ok());
+        serve(sh, reader, stream.try_clone().ok(), origin);
         sh.active.fetch_sub(1, Ordering::SeqCst);
     }
     let _ = stream.shutdown(Shutdown::Both);
@@ -237,17 +261,22 @@ fn connection(sh: &Shared, stream: UnixStream, taken: Sender<()>) {
     }
 }
 
-fn serve(sh: &Shared, mut reader: BufReader<UnixStream>, writer: Option<UnixStream>) {
+fn serve(sh: &Shared, mut reader: BufReader<UnixStream>, writer: Option<UnixStream>, origin: Origin) {
     let Some(writer) = writer else { return };
     let mut kind = String::new();
     if reader.by_ref().take(MAX_KIND).read_line(&mut kind).is_err() {
         return;
     }
-    match kind.trim_end() {
-        "proxy" => proxy::serve(sh, reader, writer),
-        "cred" => gateway::serve(sh, reader, writer),
-        "mcp" => serve_mcp(sh, reader, writer),
-        other => {
+    match (origin, kind.trim_end()) {
+        (_, "proxy") => proxy::serve(sh, reader, writer, origin),
+        // The browser VM has no business with cred itself.
+        (Origin::Agent, "cred") => gateway::serve(sh, reader, writer),
+        (Origin::Agent, "mcp") => serve_mcp(sh, reader, writer),
+        (Origin::Browser, other) => {
+            let other: String = other.chars().filter(|c| c.is_ascii_graphic()).take(MAX_KIND as usize).collect();
+            sh.log.write(&Entry { host: Some(other), ..Entry::new("unknown", "blocked:browser-kind") });
+        }
+        (Origin::Agent, other) => {
             let other: String = other.chars().filter(|c| c.is_ascii_graphic()).take(MAX_KIND as usize).collect();
             sh.log.write(&Entry { host: Some(other), ..Entry::new("unknown", "blocked:unknown-kind") });
         }
@@ -316,6 +345,9 @@ impl<T: Write> Write for Counting<T> {
 struct Entry {
     /// `proxy` (a connection), `request` (one request inside it), `model` (the gateway), `mcp`, or `unknown`.
     kind: &'static str,
+    /// The site whose page made a browser VM's request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    site: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     host: Option<String>,
     /// The address connected to.
@@ -340,7 +372,7 @@ struct Entry {
 
 impl Entry {
     fn new(kind: &'static str, decision: &str) -> Self {
-        Self { kind, host: None, addr: None, path: None, method: None, url: None, status: None, up: 0, down: 0, decision: decision.to_string() }
+        Self { kind, site: None, host: None, addr: None, path: None, method: None, url: None, status: None, up: 0, down: 0, decision: decision.to_string() }
     }
 }
 
@@ -371,6 +403,10 @@ impl Log {
 
 #[cfg(test)]
 mod intercept_tests;
+#[cfg(test)]
+mod page_tests;
+#[cfg(test)]
+mod page_vm_tests;
 #[cfg(test)]
 mod inspect_tests;
 #[cfg(test)]

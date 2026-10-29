@@ -329,7 +329,7 @@ impl Server {
             }
         };
         let (child, token) = browser.runner(site)?;
-        let (session, text) = Session::open_with(site, approved, child, state.as_ref(), Some((site, &token)))?;
+        let (session, text) = Session::open_with(site, approved, child, state.as_ref(), Some((site, &token)), browser.downloads(site))?;
         self.browser = Some(session);
         Ok(note + &text)
     }
