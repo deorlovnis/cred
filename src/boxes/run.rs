@@ -26,6 +26,7 @@ use serde_json::{Map, Value, json};
 
 use super::store::{self, Layout};
 use super::{BoxPolicy, MountPolicy, mount_problem};
+use crate::chain::{self, Chain};
 use crate::{approve, door, engine, keychain, policy, seal};
 
 /// Where the store's folders appear in the VM, and where `ro` folders go.
@@ -53,6 +54,8 @@ pub trait World: Sync {
     fn site_ready(&self, site: &str) -> Result<()>;
     /// The store key of a kept box.
     fn key(&self, name: &str) -> Result<String>;
+    /// Keep where the box's log chain stands, outside the store.
+    fn record_log_head(&self, name: &str, head: &chain::Head) -> Result<()>;
     fn exec(&self, vm: &str, env: &[(String, String)], cmd: &[String], tty: bool) -> Result<ExitStatus>;
 }
 
@@ -101,6 +104,10 @@ impl World for Real {
     fn key(&self, name: &str) -> Result<String> {
         keychain::get(&super::key(name), super::KEY_FIELD)
             .ok_or_else(|| anyhow!("the key of box {name} isn't in the Keychain, so its store can't be opened (cred box rm {name})"))
+    }
+
+    fn record_log_head(&self, name: &str, head: &chain::Head) -> Result<()> {
+        keychain::set(&super::key(name), super::LOG_HEAD_FIELD, &serde_json::to_string(head)?)
     }
 
     fn exec(&self, vm: &str, env: &[(String, String)], cmd: &[String], tty: bool) -> Result<ExitStatus> {
@@ -268,12 +275,30 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
     let _ = store::log_event(&mnt, &log_key, "box", &req.id, 0, "stopped");
     drop(vm_guard);
     drop(door);
+    if req.persistent {
+        record_head(world, req.name, &mnt, log_key);
+    }
     drop(store);
     if req.unique {
         let _ = fs::remove_file(layout.lock(&req.id));
     }
     drop(lock);
     exit_code(status?)
+}
+
+/// Note where the log's chain stands, so `cred box log --verify` can tell a log whose chain was
+/// stripped or whose end was cut off. A log whose chain is already broken keeps the head it had.
+fn record_head(world: &dyn World, name: &str, mnt: &Path, log_key: [u8; 32]) {
+    match Chain::new(&store::door_log(mnt), log_key).verify() {
+        Ok(found) => {
+            if let Some(head) = found.head()
+                && let Err(e) = world.record_log_head(name, &head)
+            {
+                eprintln!("cred: keeping where the log of box {name} stands: {e:#}");
+            }
+        }
+        Err(e) => eprintln!("cred: the log of box {name}: {e:#}"),
+    }
 }
 
 /// The VM stops when this is dropped, and its socket goes.
@@ -467,6 +492,8 @@ mod tests {
         ca: Option<String>,
         door_ca: Option<String>,
         net: Option<NetSeen>,
+        /// The lines of the log head recorded when the box was put away.
+        log_head: Option<usize>,
         exec: Option<ExecSeen>,
         /// Files of the box as the agent would find them, read when it starts.
         files: BTreeMap<String, String>,
@@ -559,6 +586,11 @@ mod tests {
 
         fn key(&self, _name: &str) -> Result<String> {
             Ok(self.key.clone())
+        }
+
+        fn record_log_head(&self, _name: &str, head: &chain::Head) -> Result<()> {
+            self.seen.lock().unwrap().log_head = Some(head.lines);
+            Ok(())
         }
 
         fn exec(&self, _vm: &str, env: &[(String, String)], cmd: &[String], tty: bool) -> Result<ExitStatus> {
@@ -718,12 +750,14 @@ mod tests {
         run(&s.layout, &first, &request(&s, &p, true)).unwrap();
         assert_eq!(first.seen.lock().unwrap().net.as_ref().unwrap().2, log_key, "the door chains its log with a key derived from the box key");
         assert!(s.layout.bundle("r").exists() && !store::is_mounted(&s.layout.mount_point("r")));
+        assert_eq!(first.seen.lock().unwrap().log_head, Some(2), "where the log stands (started, stopped) is kept outside the store");
 
         // The source changes; the agent's copy is not replaced.
         fs::write(s.dir.0.join("proj/README"), "changed on the Mac").unwrap();
         let second = Fake { key, ..Fake::default() };
         run(&s.layout, &second, &request(&s, &p, true)).unwrap();
         assert_eq!(second.seen.lock().unwrap().files["work/proj/README"], "agent's edit");
+        assert_eq!(second.seen.lock().unwrap().log_head, Some(4));
         assert!(s.layout.bundle("r").exists());
     }
 
@@ -831,6 +865,7 @@ mod tests {
         let id = "r-tmp-0a1b2c3d".to_string();
         run(&s.layout, &fake, &Request { id: id.clone(), unique: true, ..request(&s, &p, false) }).unwrap();
         assert_eq!(fake.seen.lock().unwrap().spec.as_ref().unwrap().0, "cred-box-r-tmp-0a1b2c3d");
+        assert_eq!(fake.seen.lock().unwrap().log_head, None, "a box that isn't kept keeps nothing");
         assert!(!s.layout.ephemeral_bundle(&id).exists() && !s.layout.lock(&id).exists());
     }
 

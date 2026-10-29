@@ -27,7 +27,7 @@ use jiff::tz::TimeZone;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::chain::Chain;
+use crate::chain::{self, Chain};
 use crate::door::inspect::parse_prefix;
 use crate::policy::{self, Approval, Mode, Site, Status};
 use crate::util::{config_dir, expand_home, home};
@@ -38,6 +38,8 @@ use store::Layout;
 pub const KEY_PREFIX: &str = "box.";
 /// The Keychain field of a box's store key. Field names can't start with "_".
 const KEY_FIELD: &str = "_key";
+/// The Keychain field of where the box's door log stood when it last stopped (`chain::Head`).
+pub const LOG_HEAD_FIELD: &str = "_loghead";
 /// A box's name also names its VM and its socket (104-byte limit), so it stays short.
 const MAX_NAME: usize = 32;
 
@@ -510,6 +512,10 @@ pub fn log(name: &str, last: usize, verify: bool) -> Result<()> {
         if verify {
             let chain = Chain::new(&store::door_log(mnt), log_key(&box_key(name)?));
             let found = chain.verify().with_context(|| format!("the log of box {name}"))?;
+            let head = keychain::get_silently(&key(name), LOG_HEAD_FIELD).and_then(|h| serde_json::from_str::<chain::Head>(&h).ok());
+            if let Some(head) = &head {
+                found.check(head).with_context(|| format!("the log of box {name}"))?;
+            }
             let before = if found.unchained > 0 { format!(" ({} older lines from before the log was chained can't be checked)", found.unchained) } else { String::new() };
             println!("{} lines, chain intact{before}", found.chained);
             return Ok(());
@@ -626,6 +632,7 @@ pub fn rm(name: &str) -> Result<()> {
     approve::confirm(&format!("delete box {name}: its data can never be read again"))?;
     // The key goes first: without it the store is noise, whatever happens to the files.
     keychain::delete(&k, KEY_FIELD);
+    keychain::delete(&k, LOG_HEAD_FIELD);
     policy::revoke(&k);
     store::shred(&bundle)?;
     run::sweep(&layout, name)?;

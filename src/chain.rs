@@ -2,7 +2,8 @@
 //! door's, in the box's store). Each line gets a `mac` field: HMAC-SHA256, with a key only cred
 //! holds, over the previous line's mac and this line's other fields. Editing a line, or taking
 //! one out of the middle, breaks the chain from there on, which `verify` reports. Cutting off the
-//! end can't be seen: there is no later line to notice it. (The same scheme as `audit`.)
+//! end can't be seen from the log alone; the `Head` that cred keeps elsewhere when a box stops
+//! covers that up to the last stop. (The same scheme as `audit`.)
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -30,6 +31,36 @@ pub struct Verified {
     pub chained: usize,
     /// Lines from before the log was chained: they can't be checked.
     pub unchained: usize,
+    /// The mac of each chained line, first to last.
+    pub macs: Vec<String>,
+}
+
+/// Where a log's chain stood when cred last put it away: how many chained lines, and the mac of
+/// the last. Kept outside the log (in the Keychain), it is what shows a log whose chain was
+/// stripped, or whose end was cut off before that point.
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Head {
+    pub lines: usize,
+    pub mac: String,
+}
+
+impl Verified {
+    pub fn head(&self) -> Option<Head> {
+        self.macs.last().map(|mac| Head { lines: self.macs.len(), mac: mac.clone() })
+    }
+
+    /// Whether this log still holds `head`: at least as many chained lines, the same mac there.
+    pub fn check(&self, head: &Head) -> Result<()> {
+        match self.macs.get(head.lines.wrapping_sub(1)) {
+            Some(mac) if *mac == head.mac => Ok(()),
+            Some(_) => bail!("line {} isn't the one cred recorded when the box last stopped: the log was replaced or rewritten", self.unchained + head.lines),
+            None => bail!(
+                "the log has {} chained lines, but had {} when the box last stopped: lines were cut off or their chain was stripped",
+                self.macs.len(),
+                head.lines
+            ),
+        }
+    }
 }
 
 impl Chain {
@@ -74,13 +105,14 @@ impl Chain {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", self.path.display())),
         };
-        let (mut prev, mut found) = (String::new(), Verified { chained: 0, unchained: 0 });
+        let (mut prev, mut found) = (String::new(), Verified { chained: 0, unchained: 0, macs: Vec::new() });
         for (no, line) in text.lines().enumerate().map(|(i, l)| (i + 1, l)).filter(|(_, l)| !l.trim().is_empty()) {
             let broken = || anyhow!("the chain breaks at line {no}: that line, or one before it, was changed or removed");
             let Ok(Value::Object(mut fields)) = serde_json::from_str::<Value>(line) else { return Err(broken()) };
             match fields.remove(MAC) {
                 None if found.chained == 0 => found.unchained += 1,
                 Some(Value::String(mac)) if self.mac(&prev, &fields)? == mac => {
+                    found.macs.push(mac.clone());
                     prev = mac;
                     found.chained += 1;
                 }
@@ -130,13 +162,59 @@ mod tests {
         fs::write(&chain.path, lines.join("\n") + "\n").unwrap();
     }
 
+    fn counts(chain: &Chain) -> (usize, usize) {
+        let found = chain.verify().unwrap();
+        (found.chained, found.unchained)
+    }
+
+    #[test]
+    fn the_head_kept_elsewhere_shows_a_stripped_cut_or_replaced_log() {
+        let dir = TempDir::new("cred-chain").unwrap();
+        let c = chain(&dir);
+        write(&c, 5);
+        let head = c.verify().unwrap().head().unwrap();
+        assert_eq!(head.lines, 5);
+        let original = lines(&c);
+
+        // More lines since: the head still holds.
+        write(&c, 2);
+        c.verify().unwrap().check(&head).unwrap();
+
+        // Every mac taken out: on its own the log reads as one from before chaining.
+        let stripped: Vec<String> = original
+            .iter()
+            .map(|l| {
+                let mut v: Value = serde_json::from_str(l).unwrap();
+                v.as_object_mut().unwrap().remove(MAC);
+                v.to_string()
+            })
+            .collect();
+        put(&c, &stripped);
+        assert_eq!(counts(&c), (0, 5), "the log alone can't tell");
+        let e = c.verify().unwrap().check(&head).unwrap_err().to_string();
+        assert!(e.contains("stripped"), "{e}");
+
+        // The end cut off.
+        put(&c, &original[..3]);
+        assert!(c.verify().unwrap().check(&head).is_err());
+
+        // A whole new log with other lines, chained with the same key.
+        fs::remove_file(&c.path).unwrap();
+        c.create().unwrap();
+        for i in 0..6 {
+            c.append(json!({ "kind": "request", "n": i, "url": "https://other.example.com/" })).unwrap();
+        }
+        let e = c.verify().unwrap().check(&head).unwrap_err().to_string();
+        assert!(e.contains("replaced"), "{e}");
+    }
+
     #[test]
     fn a_chain_of_lines_verifies() {
         let dir = TempDir::new("cred-chain").unwrap();
         let c = chain(&dir);
-        assert_eq!(c.verify().unwrap(), Verified { chained: 0, unchained: 0 }, "a log that doesn't exist is empty");
+        assert_eq!(counts(&c), (0, 0), "a log that doesn't exist is empty");
         write(&c, 5);
-        assert_eq!(c.verify().unwrap(), Verified { chained: 5, unchained: 0 });
+        assert_eq!(counts(&c), (5, 0));
         assert!(lines(&c).iter().all(|l| l.contains("\"mac\":\"")));
         // A second writer carries on from the last line.
         Chain::new(&c.path, [7; 32]).append(json!({ "kind": "box", "decision": "stopped" })).unwrap();
@@ -196,7 +274,7 @@ mod tests {
         put(&c, &old);
         c.append(json!({ "kind": "request" })).unwrap();
         c.append(json!({ "kind": "request" })).unwrap();
-        assert_eq!(c.verify().unwrap(), Verified { chained: 2, unchained: 2 });
+        assert_eq!(counts(&c), (2, 2));
         // But a line without a mac after a chained one is an edit.
         let mut l = lines(&c);
         l.push(old[0].clone());
