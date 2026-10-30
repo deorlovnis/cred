@@ -1,5 +1,6 @@
 /target
 # local design notes with private examples
-/docs/agent-access-design.md
+/docs/
 /runner/node_modules
 /box/shim/target
+.claude/
