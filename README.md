@@ -249,6 +249,7 @@ Metadata (never values) is kept in `~/.config/cred/index.json`; `CRED_INDEX` ove
 ## Development
 
 ```sh
+mise run check       # format, clippy, release check and all tests that need no human: run before pushing
 mise run e2e         # end-to-end tests: the built binary, a local test site, `cred run` and `cred mcp`
 mise run e2e-opt-in  # also the sandboxed browser, and one real Touch ID approval (you tap)
 ```

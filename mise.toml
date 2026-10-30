@@ -1,6 +1,10 @@
 [tools]
 rust = "stable"
 
+[tasks.check]
+description = "Format, lints and all tests that need no human: run before pushing"
+run = "cargo fmt --check && (cd box/shim && cargo fmt --check) && cargo clippy --all-targets -- -D warnings && cargo check --release && node --check runner/runner.mjs && cargo test"
+
 [tasks.e2e]
 description = "End-to-end tests of the built binary (no Touch ID, fake Keychain)"
 run = "cargo test --test e2e"
