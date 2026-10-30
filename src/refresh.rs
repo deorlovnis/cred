@@ -64,10 +64,7 @@ pub fn refresh_due(resources: &[String], force: bool, verbose: bool) -> bool {
 
 /// Resources whose approved policy refreshes something.
 pub fn auto_resources() -> Vec<String> {
-    policy::names()
-        .into_iter()
-        .filter(|res| policy::load(res).is_ok_and(|a| !a.policy.refresh.is_empty()))
-        .collect()
+    policy::names().into_iter().filter(|res| policy::load(res).is_ok_and(|a| !a.policy.refresh.is_empty())).collect()
 }
 
 /// Get a field's fresh value and store it. Messages go to stderr, so a refresh inside
@@ -108,12 +105,7 @@ fn run_script(res: &str, approved: &Approved, field: &str) -> Result<String> {
             command.env(format!("CRED_{}", name.to_uppercase()), v);
         }
     }
-    let out = command
-        .env(REFRESHING, res)
-        .stdin(Stdio::null())
-        .stderr(Stdio::inherit())
-        .output()
-        .with_context(|| format!("running the refresh script for {res}/{field}"))?;
+    let out = command.env(REFRESHING, res).stdin(Stdio::null()).stderr(Stdio::inherit()).output().with_context(|| format!("running the refresh script for {res}/{field}"))?;
     if !out.status.success() {
         bail!("refresh script for {res}/{field} failed ({})", out.status);
     }

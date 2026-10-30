@@ -179,11 +179,13 @@ fn the_door_ends_tls_for_a_guest_that_trusts_only_the_box_ca() {
     let public = |last: u8| IpAddr::from([93, 184, 216, last]);
     let routes = [(public(34), good), (public(35), wrong_name), (public(36), untrusted)];
     let net = Net::new(
-        Box::new(move |host| Ok(vec![match host {
-            "good.example.com" => public(34),
-            "wrongname.example.com" => public(35),
-            _ => public(36),
-        }])),
+        Box::new(move |host| {
+            Ok(vec![match host {
+                "good.example.com" => public(34),
+                "wrongname.example.com" => public(35),
+                _ => public(36),
+            }])
+        }),
         Box::new(move |addr| TcpStream::connect(routes.iter().find(|(ip, _)| *ip == addr.ip()).unwrap().1)),
     )
     .trusting(trust_only(&sites.cert_pem()));
@@ -193,7 +195,20 @@ fn the_door_ends_tls_for_a_guest_that_trusts_only_the_box_ca() {
     shim.0.set_nonblocking(true).unwrap();
     let log = dir.0.join("log").join("door.log");
     let door = Door::start_with(
-        Config { name: "testbox".into(), socket, allow: vec!["*".into()], model: None, sites: vec![], net: inspect::Net { writes: Mode::Allow, allow_writes: vec![] }, log_key: [9; 32], log: log.clone(), ca: Some(box_ca.clone()), browser_socket: None, browser_tokens: Default::default(), browser: None },
+        Config {
+            name: "testbox".into(),
+            socket,
+            allow: vec!["*".into()],
+            model: None,
+            sites: vec![],
+            net: inspect::Net { writes: Mode::Allow, allow_writes: vec![] },
+            log_key: [9; 32],
+            log: log.clone(),
+            ca: Some(box_ca.clone()),
+            browser_socket: None,
+            browser_tokens: Default::default(),
+            browser: None,
+        },
         net,
     )
     .unwrap();
@@ -304,7 +319,20 @@ fn real_vm_tools_trust_the_door_and_only_the_door() {
     };
     let ca = Arc::new(BoxCa::generate("e2e").unwrap());
     let log = dir.join("log").join("door.log");
-    let config = Config { name: name.clone(), socket: spec.socket.clone(), allow: vec!["*".into()], model: None, sites: vec![], net: Default::default(), log_key: [9; 32], log: log.clone(), ca: Some(ca.clone()), browser_socket: None, browser_tokens: Default::default(), browser: None };
+    let config = Config {
+        name: name.clone(),
+        socket: spec.socket.clone(),
+        allow: vec!["*".into()],
+        model: None,
+        sites: vec![],
+        net: Default::default(),
+        log_key: [9; 32],
+        log: log.clone(),
+        ca: Some(ca.clone()),
+        browser_socket: None,
+        browser_tokens: Default::default(),
+        browser: None,
+    };
     let door = Door::start(config).unwrap();
     let vm = Vm(name.clone());
     engine::run(&spec).unwrap();

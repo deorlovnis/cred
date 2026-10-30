@@ -117,9 +117,7 @@ impl Rig {
 
     fn fake(dir: &Path, keep: bool) -> Self {
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-runner.mjs");
-        Self::new(dir, keep, true, move || {
-            Command::new("node").arg(&script).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap()
-        })
+        Self::new(dir, keep, true, move || Command::new("node").arg(&script).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap())
     }
 
     fn browser(&self) -> Arc<dyn BoxBrowser> {

@@ -125,18 +125,10 @@ fn capture(cmd: &mut Command, what: &str) -> Result<String> {
 
 /// `container` is installed and its system service is running.
 pub fn available() -> Result<()> {
-    let status = container()
-        .args(["system", "status"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| match e.kind() {
-            ErrorKind::NotFound => anyhow!(
-                "Apple's `container` isn't installed: get it from https://github.com/apple/container/releases"
-            ),
-            _ => anyhow!("running container: {e}"),
-        })?;
+    let status = container().args(["system", "status"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().map_err(|e| match e.kind() {
+        ErrorKind::NotFound => anyhow!("Apple's `container` isn't installed: get it from https://github.com/apple/container/releases"),
+        _ => anyhow!("running container: {e}"),
+    })?;
     if !status.success() {
         bail!("container's system service isn't running: start it with `container system start`");
     }
@@ -153,12 +145,7 @@ pub fn available() -> Result<()> {
 /// /run/cred/door.sock has to be on a writable root. The image takes away what the agent could
 /// write there instead (see box/agent.Containerfile).
 fn run_args(spec: &VmSpec, image: &str) -> Result<Vec<String>> {
-    let mut args: Vec<String> = [
-        "run", "--progress", "none", "--detach", "--rm", "--init", "--network", "none", "--tmpfs", "/tmp",
-        "--tmpfs", "/var/tmp",
-    ]
-    .map(String::from)
-    .into();
+    let mut args: Vec<String> = ["run", "--progress", "none", "--detach", "--rm", "--init", "--network", "none", "--tmpfs", "/tmp", "--tmpfs", "/var/tmp"].map(String::from).into();
     args.extend(["--name".into(), spec.name.clone()]);
     args.extend(["--cpus".into(), spec.cpus.to_string(), "--memory".into(), spec.memory.clone()]);
     args.extend(["--publish-socket".into(), format!("{}:{DOOR_SOCKET}", spec.socket.display())]);
@@ -194,11 +181,7 @@ pub fn run(spec: &VmSpec) -> Result<()> {
         }
     }
     if let Some(dir) = spec.socket.parent() {
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-            .with_context(|| format!("creating {}", dir.display()))?;
+        DirBuilder::new().recursive(true).mode(0o700).create(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let image = local_image(&spec.image)?;
     capture(container().args(run_args(spec, &image)?), &format!("starting {}", spec.name))?;
@@ -272,15 +255,7 @@ pub fn run_browser(spec: &BrowserSpec) -> Result<()> {
         DirBuilder::new().recursive(true).mode(0o700).create(host).with_context(|| format!("creating {}", host.display()))?;
         mounts.push(Mount { host: host.clone(), guest: BROWSER_DOWNLOADS.into(), readonly: false });
     }
-    run(&VmSpec {
-        name: spec.name.clone(),
-        image: spec.image.clone(),
-        cpus: 2,
-        memory: "2G".into(),
-        socket: spec.socket.clone(),
-        mounts,
-        docker: false,
-    })
+    run(&VmSpec { name: spec.name.clone(), image: spec.image.clone(), cpus: 2, memory: "2G".into(), socket: spec.socket.clone(), mounts, docker: false })
 }
 
 /// Start a runner in the browser VM (`node /opt/runner/runner.mjs`, as the VM's user 1000),
@@ -366,10 +341,7 @@ pub fn stop(name: &str) -> Result<()> {
 fn inspect_digest(reference: &str) -> Result<String> {
     let json = capture(container().args(["image", "inspect", reference]), &format!("inspecting image {reference}"))?;
     let v: Value = serde_json::from_str(&json).context("reading container's image description")?;
-    Ok(v[0]["configuration"]["descriptor"]["digest"]
-        .as_str()
-        .with_context(|| format!("container gave no digest for image {reference}"))?
-        .to_string())
+    Ok(v[0]["configuration"]["descriptor"]["digest"].as_str().with_context(|| format!("container gave no digest for image {reference}"))?.to_string())
 }
 
 /// "cred-agent" or "cred-agent:latest" -> "cred-agent@sha256:...", which a policy can pin.
@@ -412,14 +384,7 @@ pub fn build_agent_image(repo_box_dir: &Path) -> Result<String> {
     if !containerfile.is_file() {
         bail!("no agent.Containerfile in {}", repo_box_dir.display());
     }
-    let status = container()
-        .arg("build")
-        .arg("-f")
-        .arg(&containerfile)
-        .args(["-t", AGENT_IMAGE])
-        .arg(repo_box_dir)
-        .status()
-        .context("running container build")?;
+    let status = container().arg("build").arg("-f").arg(&containerfile).args(["-t", AGENT_IMAGE]).arg(repo_box_dir).status().context("running container build")?;
     if !status.success() {
         bail!("building the agent image failed ({status})");
     }
@@ -434,14 +399,7 @@ pub fn build_browser_image(repo_box_dir: &Path) -> Result<String> {
         bail!("no browser.Containerfile in {}", repo_box_dir.display());
     }
     let context = repo_box_dir.parent().context("the box folder has no parent")?;
-    let status = container()
-        .arg("build")
-        .arg("-f")
-        .arg(&containerfile)
-        .args(["-t", BROWSER_IMAGE])
-        .arg(context)
-        .status()
-        .context("running container build")?;
+    let status = container().arg("build").arg("-f").arg(&containerfile).args(["-t", BROWSER_IMAGE]).arg(context).status().context("running container build")?;
     if !status.success() {
         bail!("building the browser image failed ({status})");
     }
@@ -469,9 +427,7 @@ mod tests {
 
     #[test]
     fn env_uses_stand_ins_and_the_right_key() {
-        let get = |env: &[(String, String)], k: &str| {
-            env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone())
-        };
+        let get = |env: &[(String, String)], k: &str| env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
         let oauth = agent_env(true);
         assert_eq!(get(&oauth, "CLAUDE_CODE_OAUTH_TOKEN").as_deref(), Some("cred-managed"));
         assert_eq!(get(&oauth, "ANTHROPIC_API_KEY"), None);
@@ -510,9 +466,21 @@ mod tests {
         assert_eq!(
             args,
             [
-                "exec", "--uid", "1000", "--gid", "1000", "-i", "-e", "HOME=/home/browser", "-e",
-                "PLAYWRIGHT_BROWSERS_PATH=/ms-playwright", "-e", "CRED_RUNNER_DEBUG_NO_ROUTING=1", "cred-browser-research",
-                "node", "/opt/runner/runner.mjs"
+                "exec",
+                "--uid",
+                "1000",
+                "--gid",
+                "1000",
+                "-i",
+                "-e",
+                "HOME=/home/browser",
+                "-e",
+                "PLAYWRIGHT_BROWSERS_PATH=/ms-playwright",
+                "-e",
+                "CRED_RUNNER_DEBUG_NO_ROUTING=1",
+                "cred-browser-research",
+                "node",
+                "/opt/runner/runner.mjs"
             ]
         );
     }
@@ -528,10 +496,7 @@ mod tests {
         let env = vec![("A".to_string(), "b c".to_string())];
         let cmd = exec_command("vm", &env, &["ls".into(), "-l".into()], true);
         let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert_eq!(
-            args,
-            ["exec", "--uid", "1000", "--gid", "1000", "-i", "-t", "-e", "A=b c", "vm", "ls", "-l"]
-        );
+        assert_eq!(args, ["exec", "--uid", "1000", "--gid", "1000", "-i", "-t", "-e", "A=b c", "vm", "ls", "-l"]);
     }
 
     #[test]

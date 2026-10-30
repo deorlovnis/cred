@@ -198,9 +198,7 @@ enum BoxCmd {
         verify: bool,
     },
     /// Stop a running box and lock it
-    Stop {
-        name: String,
-    },
+    Stop { name: String },
     /// Copy a file or folder out of a box (Touch ID); lists each file with its size and sha256
     Export {
         #[arg(value_parser = boxes::parse_name)]
@@ -257,22 +255,19 @@ enum PolicyCmd {
 
 fn parse_resource(s: &str) -> Result<String, String> {
     let mut chars = s.chars();
-    let ok = chars.next().is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    let ok = chars.next().is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
     if ok { Ok(s.to_string()) } else { Err("use lowercase letters, digits and -, e.g. github".into()) }
 }
 
 fn parse_field(s: &str) -> Result<String, String> {
     let mut chars = s.chars();
-    let ok = chars.next().is_some_and(|c| c.is_ascii_lowercase())
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    let ok = chars.next().is_some_and(|c| c.is_ascii_lowercase()) && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
     if ok { Ok(s.to_string()) } else { Err("use lowercase letters, digits and _, e.g. token".into()) }
 }
 
 fn parse_env(s: &str) -> Result<String, String> {
     let mut chars = s.chars();
-    let ok = chars.next().is_some_and(|c| c.is_ascii_uppercase() || c == '_')
-        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    let ok = chars.next().is_some_and(|c| c.is_ascii_uppercase() || c == '_') && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
     if ok { Ok(s.to_string()) } else { Err("use ENV_VAR style, e.g. GITHUB_TOKEN".into()) }
 }
 
@@ -358,20 +353,9 @@ fn cmd_update(res: &str, field: &str, expires: Option<Date>) -> Result<()> {
         Some(d) => Expiry::Set(d),
         None if jwt_exp(&value).is_some() => Expiry::Keep,
         None if interactive() => {
-            let old = Index::load()?
-                .map
-                .get(res)
-                .and_then(|r| r.fields.get(field))
-                .and_then(|f| f.expires)
-                .map_or("none".to_string(), |d| d.to_string());
-            let answer = ask(&format!(
-                "New expiry for {res}/{field}, YYYY-MM-DD (was {old}; blank = no expiry): "
-            ))?;
-            if answer.is_empty() {
-                Expiry::Clear
-            } else {
-                Expiry::Set(parse_date(&answer).map_err(|e| anyhow::anyhow!("expiry {e}"))?)
-            }
+            let old = Index::load()?.map.get(res).and_then(|r| r.fields.get(field)).and_then(|f| f.expires).map_or("none".to_string(), |d| d.to_string());
+            let answer = ask(&format!("New expiry for {res}/{field}, YYYY-MM-DD (was {old}; blank = no expiry): "))?;
+            if answer.is_empty() { Expiry::Clear } else { Expiry::Set(parse_date(&answer).map_err(|e| anyhow::anyhow!("expiry {e}"))?) }
         }
         None => Expiry::Clear,
     };
@@ -495,18 +479,8 @@ fn cmd_ls() -> Result<()> {
     for (res, r) in &idx.map {
         let approved = policy::load(res).ok();
         let auto = |n: &str| approved.as_ref().is_some_and(|a| a.policy.refresh.contains_key(n));
-        let status = r
-            .fields
-            .iter()
-            .map(|(n, f)| field_status(res, n, f, auto(n), warn))
-            .max_by_key(|(rank, _)| *rank)
-            .map_or("empty".to_string(), |(_, s)| s);
-        let expires = r
-            .fields
-            .values()
-            .filter_map(|f| Some((f.expiry_key()?, f.expiry_text()?)))
-            .min_by_key(|(key, _)| *key)
-            .map_or("-".to_string(), |(_, text)| text);
+        let status = r.fields.iter().map(|(n, f)| field_status(res, n, f, auto(n), warn)).max_by_key(|(rank, _)| *rank).map_or("empty".to_string(), |(_, s)| s);
+        let expires = r.fields.values().filter_map(|f| Some((f.expiry_key()?, f.expiry_text()?))).min_by_key(|(key, _)| *key).map_or("-".to_string(), |(_, text)| text);
         let fields: Vec<String> = r
             .fields
             .keys()
@@ -599,8 +573,7 @@ fn cmd_reseal(resources: Vec<String>) -> Result<()> {
                 eprintln!("cred: {res}/{name} not in Keychain, skipped");
                 continue;
             };
-            keychain::replace(res, name, &value)
-                .with_context(|| format!("{res}/{name} was removed but not stored again: set it with cred set {res} {name}"))?;
+            keychain::replace(res, name, &value).with_context(|| format!("{res}/{name} was removed but not stored again: set it with cred set {res} {name}"))?;
             println!("resealed {res}/{name}");
         }
         // Approvals aren't carried over: one planted by another program must not become trusted.
@@ -672,9 +645,7 @@ fn cmd_run(mut resources: Vec<String>, command: Vec<String>) -> Result<u8> {
             Mode::Allow => {}
         }
         for (name, var) in &run.export {
-            let Some(v) = keychain::get(res, name) else {
-                bail!("{res}/{name} not found in Keychain (add it with: cred set {res} {name})")
-            };
+            let Some(v) = keychain::get(res, name) else { bail!("{res}/{name} not found in Keychain (add it with: cred set {res} {name})") };
             cmd.env(var, &v);
             if !v.is_empty() {
                 masks.push(v);

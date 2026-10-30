@@ -23,11 +23,7 @@ pub struct Request<'a> {
 
 /// Make the request and describe the response as text. The caller masks it.
 pub fn perform(res: &str, approved: &Approved, req: &Request) -> Result<String> {
-    let fetch = approved
-        .policy
-        .fetch
-        .as_ref()
-        .ok_or_else(|| anyhow!("the policy for {res} allows no requests (no [fetch] section)"))?;
+    let fetch = approved.policy.fetch.as_ref().ok_or_else(|| anyhow!("the policy for {res} allows no requests (no [fetch] section)"))?;
     let method = req.method.to_ascii_uppercase();
     if !METHODS.contains(&method.as_str()) {
         bail!("method must be one of {}", METHODS.join(", "));
@@ -43,9 +39,7 @@ pub fn perform(res: &str, approved: &Approved, req: &Request) -> Result<String> 
 
     let mut request = http::Request::builder().method(method.as_str()).uri(url.as_str());
     if let Some(template) = &fetch.auth {
-        let value = policy::fill(template, |field| {
-            keychain::get(res, field).ok_or_else(|| anyhow!("{res}/{field} isn't stored (cred set {res} {field})"))
-        })?;
+        let value = policy::fill(template, |field| keychain::get(res, field).ok_or_else(|| anyhow!("{res}/{field} isn't stored (cred set {res} {field})")))?;
         request = request.header(fetch.auth_header.as_str(), value);
     }
     for (name, value) in &fetch.headers {
@@ -54,13 +48,8 @@ pub fn perform(res: &str, approved: &Approved, req: &Request) -> Result<String> 
     if let Some(content_type) = req.content_type {
         request = request.header("content-type", content_type);
     }
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .max_redirects(0)
-        .max_redirects_will_error(false)
-        .http_status_as_error(false)
-        .timeout_global(Some(Duration::from_secs(30)))
-        .build()
-        .into();
+    let agent: ureq::Agent =
+        ureq::Agent::config_builder().max_redirects(0).max_redirects_will_error(false).http_status_as_error(false).timeout_global(Some(Duration::from_secs(30))).build().into();
     let response = match req.body {
         Some(body) => agent.run(request.body(body.as_bytes().to_vec())?),
         None => agent.run(request.body(())?),

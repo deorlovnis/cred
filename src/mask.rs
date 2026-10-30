@@ -17,9 +17,7 @@ pub struct Masker {
 impl Masker {
     pub fn new(values: impl IntoIterator<Item = String>) -> Self {
         let values: Vec<String> = values.into_iter().filter(|v| v.len() >= MIN_LEN).collect();
-        let ac = (!values.is_empty())
-            .then(|| AhoCorasick::builder().match_kind(MatchKind::LeftmostLongest).build(&values).ok())
-            .flatten();
+        let ac = (!values.is_empty()).then(|| AhoCorasick::builder().match_kind(MatchKind::LeftmostLongest).build(&values).ok()).flatten();
         Self { ac, values: values.into_iter().map(String::into_bytes).collect() }
     }
 

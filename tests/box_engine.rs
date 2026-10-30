@@ -176,10 +176,7 @@ fn vm_has_only_the_door() {
         cpus: 2,
         memory: "2G".into(),
         socket: dir.join("door.sock"),
-        mounts: vec![
-            engine::Mount { host: home.clone(), guest: "/home/agent".into(), readonly: false },
-            engine::Mount { host: ro, guest: "/ro".into(), readonly: true },
-        ],
+        mounts: vec![engine::Mount { host: home.clone(), guest: "/home/agent".into(), readonly: false }, engine::Mount { host: ro, guest: "/ro".into(), readonly: true }],
         docker: false,
     };
     let door = TestDoor::start(&spec.socket);
@@ -193,13 +190,7 @@ fn vm_has_only_the_door() {
     println!("first exec ran after {:?}", started.elapsed());
 
     // the engine's exec: the agent's identity, the environment, the exit status
-    let status = engine::exec(
-        &name,
-        &env,
-        &["sh".into(), "-c".into(), "test \"$(id -u):$(id -g):$HOME\" = 1000:1000:/home/agent && exit 3".into()],
-        false,
-    )
-    .unwrap();
+    let status = engine::exec(&name, &env, &["sh".into(), "-c".into(), "test \"$(id -u):$(id -g):$HOME\" = 1000:1000:/home/agent && exit 3".into()], false).unwrap();
     assert_eq!(status.code(), Some(3));
 
     // HTTPS through the proxy listener reaches the door as `proxy` with the CONNECT line
@@ -214,11 +205,7 @@ fn vm_has_only_the_door() {
 
     // cred-shim mcp: stdio in and out, paired with a connection of kind `mcp`
     let mcp = ["cred-shim".to_string(), "mcp".to_string()];
-    let mut child = engine::exec_command(&name, &[], &mcp, false)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = engine::exec_command(&name, &[], &mcp, false).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     stdin.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1}\n").unwrap();

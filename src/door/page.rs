@@ -70,7 +70,9 @@ pub(super) fn identify(head: &Head, tokens: &Tokens, sites: &[String]) -> Identi
     let Some(encoded) = value.split_once(' ').filter(|(scheme, _)| scheme.eq_ignore_ascii_case("basic")).map(|(_, rest)| rest.trim()) else {
         return Identity::Refused;
     };
-    let Some((user, token)) = STANDARD.decode(encoded).ok().and_then(|raw| String::from_utf8(raw).ok()).and_then(|text| text.split_once(':').map(|(u, t)| (u.to_string(), t.to_string()))) else {
+    let Some((user, token)) =
+        STANDARD.decode(encoded).ok().and_then(|raw| String::from_utf8(raw).ok()).and_then(|text| text.split_once(':').map(|(u, t)| (u.to_string(), t.to_string())))
+    else {
         return Identity::Refused;
     };
     match tokens.site(&token) {

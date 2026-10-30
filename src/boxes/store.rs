@@ -222,8 +222,7 @@ pub fn detach(mnt: &Path) -> Result<()> {
             hdiutil(&["detach".as_ref(), mnt.as_os_str()], None).is_ok() || !is_mounted(mnt)
         });
         if !polite {
-            hdiutil(&["detach".as_ref(), "-force".as_ref(), mnt.as_os_str()], None)
-                .with_context(|| format!("detaching {}", mnt.display()))?;
+            hdiutil(&["detach".as_ref(), "-force".as_ref(), mnt.as_os_str()], None).with_context(|| format!("detaching {}", mnt.display()))?;
         }
     }
     let _ = fs::remove_dir(mnt);
@@ -269,16 +268,8 @@ pub fn open(bundle: &Path, mnt: &Path, key: &str, readonly: bool) -> Result<Open
     }
     detach(mnt)?;
     fs::DirBuilder::new().mode(0o700).create(mnt).with_context(|| format!("creating {}", mnt.display()))?;
-    let mut args: Vec<&std::ffi::OsStr> = vec![
-        "attach".as_ref(),
-        "-stdinpass".as_ref(),
-        "-nobrowse".as_ref(),
-        "-noautoopen".as_ref(),
-        "-owners".as_ref(),
-        "on".as_ref(),
-        "-mountpoint".as_ref(),
-        mnt.as_os_str(),
-    ];
+    let mut args: Vec<&std::ffi::OsStr> =
+        vec!["attach".as_ref(), "-stdinpass".as_ref(), "-nobrowse".as_ref(), "-noautoopen".as_ref(), "-owners".as_ref(), "on".as_ref(), "-mountpoint".as_ref(), mnt.as_os_str()];
     if readonly {
         args.push("-readonly".as_ref());
     }
@@ -310,13 +301,7 @@ pub struct Lock(#[allow(dead_code)] File);
 /// a child that one of our threads has forked but not yet exec'd still shares the lock of a
 /// file we just let go of.
 pub fn lock(path: &Path) -> Result<Option<Lock>> {
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("opening {}", path.display()))?;
+    let file = OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(path).with_context(|| format!("opening {}", path.display()))?;
     for attempt in 0..20 {
         match file.try_lock() {
             Ok(()) => return Ok(Some(Lock(file))),
@@ -425,12 +410,7 @@ fn copy_dir(src: &Path, dst: &Path, rel: &Path, copied: &mut Copied) -> Result<(
 fn copy_file(src: &Path, dst: &Path, meta: &fs::Metadata) -> Result<()> {
     let mode = if meta.mode() & 0o111 != 0 { 0o755 } else { 0o644 };
     let mut from = File::open(src).with_context(|| format!("reading {}", src.display()))?;
-    let mut to = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(dst)
-        .with_context(|| format!("creating {}", dst.display()))?;
+    let mut to = OpenOptions::new().write(true).create_new(true).mode(mode).open(dst).with_context(|| format!("creating {}", dst.display()))?;
     io::copy(&mut from, &mut to).with_context(|| format!("copying {}", src.display()))?;
     Ok(())
 }

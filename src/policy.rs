@@ -231,9 +231,9 @@ impl Site {
         match self {
             Site::Any => origin.starts_with("https://"),
             Site::Exact(o) => o == origin,
-            Site::Domain { scheme, domain } => Url::parse(origin).is_ok_and(|u| {
-                u.scheme() == scheme && u.host_str().is_some_and(|h| h == domain || h.ends_with(&format!(".{domain}")))
-            }),
+            Site::Domain { scheme, domain } => {
+                Url::parse(origin).is_ok_and(|u| u.scheme() == scheme && u.host_str().is_some_and(|h| h == domain || h.ends_with(&format!(".{domain}"))))
+            }
         }
     }
 
@@ -468,11 +468,7 @@ impl Fetch {
 
 impl Tool {
     fn split(&self) -> Result<(&str, &str)> {
-        let (method, template) = self
-            .request
-            .trim()
-            .split_once(' ')
-            .ok_or_else(|| anyhow!("tool {}: request must be \"METHOD URL\"", self.name))?;
+        let (method, template) = self.request.trim().split_once(' ').ok_or_else(|| anyhow!("tool {}: request must be \"METHOD URL\"", self.name))?;
         if !METHODS.contains(&method) {
             bail!("tool {}: method must be one of {}", self.name, METHODS.join(", "));
         }

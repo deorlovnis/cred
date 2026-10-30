@@ -30,12 +30,8 @@ impl Head {
 
     /// Whether the connection stays open after the response.
     pub fn keep_alive(&self) -> bool {
-        let wants = |token: &str| {
-            self.headers
-                .iter()
-                .filter(|(n, _)| n.eq_ignore_ascii_case("connection"))
-                .any(|(_, v)| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)))
-        };
+        let wants =
+            |token: &str| self.headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case("connection")).any(|(_, v)| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)));
         match self.parts() {
             Some((_, _, "HTTP/1.0")) => wants("keep-alive"),
             _ => !wants("close"),
@@ -87,12 +83,7 @@ pub fn read_head(r: &mut impl BufRead) -> io::Result<Option<Head>> {
     let line = lines.remove(0);
     let headers = lines
         .iter()
-        .map(|l| {
-            l.split_once(':')
-                .filter(|(name, _)| is_token(name))
-                .map(|(name, value)| (name.to_string(), value.trim().to_string()))
-                .ok_or_else(|| invalid("bad header line"))
-        })
+        .map(|l| l.split_once(':').filter(|(name, _)| is_token(name)).map(|(name, value)| (name.to_string(), value.trim().to_string())).ok_or_else(|| invalid("bad header line")))
         .collect::<io::Result<Vec<_>>>()?;
     Ok(Some(Head { line, headers }))
 }

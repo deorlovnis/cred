@@ -79,12 +79,8 @@ impl Sessions {
 
     /// The sites that have a session sealed (names only).
     pub fn sites(&self) -> Vec<String> {
-        let mut sites: Vec<String> = fs::read_dir(&self.dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|e| e.file_name().to_str()?.strip_suffix(&format!(".{EXTENSION}")).map(str::to_string))
-            .collect();
+        let mut sites: Vec<String> =
+            fs::read_dir(&self.dir).into_iter().flatten().flatten().filter_map(|e| e.file_name().to_str()?.strip_suffix(&format!(".{EXTENSION}")).map(str::to_string)).collect();
         sites.sort();
         sites
     }

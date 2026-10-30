@@ -136,11 +136,7 @@ fn serve_client<C: Conn>(client: C, kind: &str, pool: &Pool) -> io::Result<()> {
 }
 
 /// A thread per client, so one slow or broken client never holds up the rest.
-fn accept_loop<C: Conn>(
-    incoming: impl Iterator<Item = io::Result<C>>,
-    kind: &'static str,
-    pool: Arc<Pool>,
-) {
+fn accept_loop<C: Conn>(incoming: impl Iterator<Item = io::Result<C>>, kind: &'static str, pool: Arc<Pool>) {
     for client in incoming {
         match client {
             Ok(client) => {
@@ -167,15 +163,13 @@ fn collect_hosts(listener: UnixListener, pool: Arc<Pool>) {
 
 fn bind_unix(path: &str, mode: u32) -> io::Result<UnixListener> {
     let _ = fs::remove_file(path);
-    let listener = UnixListener::bind(path)
-        .map_err(|e| io::Error::new(e.kind(), format!("listening on {path}: {e}")))?;
+    let listener = UnixListener::bind(path).map_err(|e| io::Error::new(e.kind(), format!("listening on {path}: {e}")))?;
     fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     Ok(listener)
 }
 
 fn bind_tcp(addr: (&str, u16)) -> io::Result<TcpListener> {
-    TcpListener::bind(addr)
-        .map_err(|e| io::Error::new(e.kind(), format!("listening on {}:{}: {e}", addr.0, addr.1)))
+    TcpListener::bind(addr).map_err(|e| io::Error::new(e.kind(), format!("listening on {}:{}: {e}", addr.0, addr.1)))
 }
 
 /// The init process of the VM: the listeners, and the pool the Mac fills. Returns only on a
@@ -202,11 +196,7 @@ fn serve() -> io::Result<()> {
 
 /// `cred-shim mcp`: carry `input` and `output` (an MCP client's stdio) over `sock`, which the
 /// daemon pairs with cred's MCP server. Ends when the server hangs up.
-fn relay(
-    sock: UnixStream,
-    mut input: impl Read + Send + 'static,
-    mut output: impl Write,
-) -> io::Result<()> {
+fn relay(sock: UnixStream, mut input: impl Read + Send + 'static, mut output: impl Write) -> io::Result<()> {
     let mut up = sock.try_clone()?;
     thread::spawn(move || {
         let _ = io::copy(&mut input, &mut up);

@@ -4,13 +4,13 @@
 //! its questions about writes with Touch ID. The agent only gets page text, masked.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
-use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::fs;
 
 use anyhow::{Context, Result, anyhow, bail};
 use jiff::civil::Date;
@@ -62,13 +62,7 @@ pub fn mac_runner() -> Result<Child> {
     if !script.exists() {
         bail!("the browser runner isn't installed ({}): run install.sh", script.display());
     }
-    Command::new("node")
-        .arg(&script)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("starting the browser runner (node)")
+    Command::new("node").arg(&script).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().context("starting the browser runner (node)")
 }
 
 pub struct Session {
@@ -92,14 +86,7 @@ impl Session {
     /// The same over any runner process: `sealed` is the session to start from instead of the
     /// Keychain fields, `proxy` the (username, password) Chromium presents to the proxy in a box,
     /// `downloads` the folder pages may save to (none: downloads are refused).
-    pub fn open_with(
-        site: &str,
-        approved: &Approved,
-        mut child: Child,
-        sealed: Option<&Value>,
-        proxy: Option<(&str, &str)>,
-        downloads: Option<String>,
-    ) -> Result<(Self, String)> {
+    pub fn open_with(site: &str, approved: &Approved, mut child: Child, sealed: Option<&Value>, proxy: Option<(&str, &str)>, downloads: Option<String>) -> Result<(Self, String)> {
         let mut config = config(site, &approved.policy, sealed.map_or(Source::Fields, Source::Sealed))?;
         if let Some((user, password)) = proxy.filter(|(_, password)| !password.is_empty()) {
             config["proxy"] = json!({ "server": BOX_PROXY, "username": user, "password": password });
@@ -170,10 +157,7 @@ fn closed_state(reply: &Value) -> Option<Value> {
 
 /// What the runner needs to open a site: its rules and the session to start with.
 fn config(site: &str, policy: &Policy, source: Source) -> Result<Value> {
-    let browse = policy
-        .browse
-        .as_ref()
-        .ok_or_else(|| anyhow!("the policy for {site} doesn't allow browsing (no [browse] section)"))?;
+    let browse = policy.browse.as_ref().ok_or_else(|| anyhow!("the policy for {site} doesn't allow browsing (no [browse] section)"))?;
     let (cookies, storage) = match source {
         Source::Fields => field_parts(site, browse)?,
         Source::Sealed(_) | Source::Fresh => (Vec::new(), Vec::new()),

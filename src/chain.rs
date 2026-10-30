@@ -54,11 +54,7 @@ impl Verified {
         match self.macs.get(head.lines.wrapping_sub(1)) {
             Some(mac) if *mac == head.mac => Ok(()),
             Some(_) => bail!("line {} isn't the one cred recorded when the box last stopped: the log was replaced or rewritten", self.unchained + head.lines),
-            None => bail!(
-                "the log has {} chained lines, but had {} when the box last stopped: lines were cut off or their chain was stripped",
-                self.macs.len(),
-                head.lines
-            ),
+            None => bail!("the log has {} chained lines, but had {} when the box last stopped: lines were cut off or their chain was stripped", self.macs.len(), head.lines),
         }
     }
 }
@@ -131,10 +127,7 @@ fn last_mac(file: &mut File) -> Result<String> {
     file.read_to_end(&mut tail)?;
     let text = String::from_utf8_lossy(&tail);
     let last = text.lines().rev().find(|l| !l.trim().is_empty());
-    Ok(last
-        .and_then(|l| serde_json::from_str::<Value>(l).ok())
-        .and_then(|v| v.get(MAC).and_then(Value::as_str).map(str::to_string))
-        .unwrap_or_default())
+    Ok(last.and_then(|l| serde_json::from_str::<Value>(l).ok()).and_then(|v| v.get(MAC).and_then(Value::as_str).map(str::to_string)).unwrap_or_default())
 }
 
 #[cfg(test)]

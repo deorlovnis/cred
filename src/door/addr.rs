@@ -21,21 +21,21 @@ const MAX_TRIES: usize = 3;
 
 /// IPv4 ranges that aren't public: network, prefix length.
 const NON_PUBLIC_V4: [([u8; 4], u8); 15] = [
-    ([0, 0, 0, 0], 8),        // "this network"
-    ([10, 0, 0, 0], 8),       // private
-    ([100, 64, 0, 0], 10),    // carrier-grade NAT
-    ([127, 0, 0, 0], 8),      // loopback
-    ([169, 254, 0, 0], 16),   // link-local, cloud metadata
-    ([172, 16, 0, 0], 12),    // private
-    ([192, 0, 0, 0], 24),     // IETF protocol assignments
-    ([192, 0, 2, 0], 24),     // documentation
-    ([192, 88, 99, 0], 24),   // 6to4 relay anycast
-    ([192, 168, 0, 0], 16),   // private
-    ([198, 18, 0, 0], 15),    // benchmarking
-    ([198, 51, 100, 0], 24),  // documentation
-    ([203, 0, 113, 0], 24),   // documentation
-    ([224, 0, 0, 0], 4),      // multicast
-    ([240, 0, 0, 0], 4),      // reserved, and the broadcast address
+    ([0, 0, 0, 0], 8),       // "this network"
+    ([10, 0, 0, 0], 8),      // private
+    ([100, 64, 0, 0], 10),   // carrier-grade NAT
+    ([127, 0, 0, 0], 8),     // loopback
+    ([169, 254, 0, 0], 16),  // link-local, cloud metadata
+    ([172, 16, 0, 0], 12),   // private
+    ([192, 0, 0, 0], 24),    // IETF protocol assignments
+    ([192, 0, 2, 0], 24),    // documentation
+    ([192, 88, 99, 0], 24),  // 6to4 relay anycast
+    ([192, 168, 0, 0], 16),  // private
+    ([198, 18, 0, 0], 15),   // benchmarking
+    ([198, 51, 100, 0], 24), // documentation
+    ([203, 0, 113, 0], 24),  // documentation
+    ([224, 0, 0, 0], 4),     // multicast
+    ([240, 0, 0, 0], 4),     // reserved, and the broadcast address
 ];
 
 /// Whether cred may connect to the address on a box's behalf. Only global unicast addresses
@@ -67,10 +67,13 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
     if s[0] & 0xe000 != 0x2000 {
         return false;
     }
-    !matches!((s[0], s[1]), (0x2001, 0..0x0200)    // 2001::/23 protocol assignments, Teredo
+    !matches!(
+        (s[0], s[1]),
+        (0x2001, 0..0x0200)    // 2001::/23 protocol assignments, Teredo
         | (0x2001, 0x0db8)                         // documentation
         | (0x2002, _)                              // 6to4: embeds any IPv4 address
-        | (0x3fff, 0..0x1000)) // documentation (3fff::/20)
+        | (0x3fff, 0..0x1000)
+    ) // documentation (3fff::/20)
 }
 
 /// The names a box may reach: `"*"` (any host), `https://host` or `https://*.domain`, matched
@@ -79,10 +82,7 @@ pub struct Allow(Vec<Site>);
 
 impl Allow {
     pub fn parse(entries: &[String]) -> Result<Self> {
-        let sites = entries
-            .iter()
-            .map(|e| Site::parse(e).with_context(|| format!("[net] allow '{e}'")))
-            .collect::<Result<_>>()?;
+        let sites = entries.iter().map(|e| Site::parse(e).with_context(|| format!("[net] allow '{e}'"))).collect::<Result<_>>()?;
         Ok(Self(sites))
     }
 
@@ -226,7 +226,21 @@ mod tests {
 
     #[test]
     fn public_ipv4_addresses_pass() {
-        for ip in ["1.1.1.1", "8.8.8.8", "93.184.216.34", "140.82.112.3", "172.15.255.255", "172.32.0.1", "100.63.255.255", "100.128.0.1", "198.17.255.255", "198.20.0.1", "192.0.1.1", "192.169.0.1", "223.255.255.255"] {
+        for ip in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "93.184.216.34",
+            "140.82.112.3",
+            "172.15.255.255",
+            "172.32.0.1",
+            "100.63.255.255",
+            "100.128.0.1",
+            "198.17.255.255",
+            "198.20.0.1",
+            "192.0.1.1",
+            "192.169.0.1",
+            "223.255.255.255",
+        ] {
             assert!(public(ip), "{ip} should be public");
         }
     }
@@ -234,10 +248,31 @@ mod tests {
     #[test]
     fn non_public_ipv4_addresses_are_refused() {
         for ip in [
-            "0.0.0.0", "0.1.2.3", "10.0.0.1", "10.255.255.255", "100.64.0.1", "100.127.255.255", "127.0.0.1", "127.255.255.254",
-            "169.254.169.254", "169.254.0.1", "172.16.0.1", "172.31.255.255", "192.0.0.1", "192.0.2.1", "192.88.99.1", "192.168.0.1",
-            "192.168.255.255", "198.18.0.1", "198.19.255.255", "198.51.100.7", "203.0.113.9", "224.0.0.1", "239.255.255.250",
-            "240.0.0.1", "255.255.255.255",
+            "0.0.0.0",
+            "0.1.2.3",
+            "10.0.0.1",
+            "10.255.255.255",
+            "100.64.0.1",
+            "100.127.255.255",
+            "127.0.0.1",
+            "127.255.255.254",
+            "169.254.169.254",
+            "169.254.0.1",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.0.0.1",
+            "192.0.2.1",
+            "192.88.99.1",
+            "192.168.0.1",
+            "192.168.255.255",
+            "198.18.0.1",
+            "198.19.255.255",
+            "198.51.100.7",
+            "203.0.113.9",
+            "224.0.0.1",
+            "239.255.255.250",
+            "240.0.0.1",
+            "255.255.255.255",
         ] {
             assert!(!public(ip), "{ip} should be refused");
         }
@@ -253,9 +288,30 @@ mod tests {
     #[test]
     fn non_public_ipv6_addresses_are_refused() {
         for ip in [
-            "::", "::1", "fe80::1", "fe80::1%1", "fc00::1", "fd12:3456::1", "fec0::1", "ff02::1", "ff00::", "100::1",
-            "2001::1", "2001:0:4136:e378:8000:63bf:3fff:fdd2", "2001:1::1", "2001:db8::1", "2002::1", "2002:7f00:1::1", "2002:a00:1::",
-            "3fff::1", "3fff:fff::1", "5f00::1", "64:ff9b:1::1", "1::1", "4000::1", "8000::1",
+            "::",
+            "::1",
+            "fe80::1",
+            "fe80::1%1",
+            "fc00::1",
+            "fd12:3456::1",
+            "fec0::1",
+            "ff02::1",
+            "ff00::",
+            "100::1",
+            "2001::1",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "2001:1::1",
+            "2001:db8::1",
+            "2002::1",
+            "2002:7f00:1::1",
+            "2002:a00:1::",
+            "3fff::1",
+            "3fff:fff::1",
+            "5f00::1",
+            "64:ff9b:1::1",
+            "1::1",
+            "4000::1",
+            "8000::1",
         ] {
             let parsed: Result<IpAddr, _> = ip.parse();
             // A zone id isn't an address at all, so it can't pass either.
@@ -265,7 +321,18 @@ mod tests {
 
     #[test]
     fn ipv4_mapped_and_compatible_forms_are_refused() {
-        for ip in ["::ffff:127.0.0.1", "::ffff:10.0.0.1", "::ffff:192.168.1.1", "::ffff:169.254.169.254", "::ffff:8.8.8.8", "::ffff:0:0", "::127.0.0.1", "::10.0.0.1", "::8.8.8.8", "::0.0.0.2"] {
+        for ip in [
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::ffff:192.168.1.1",
+            "::ffff:169.254.169.254",
+            "::ffff:8.8.8.8",
+            "::ffff:0:0",
+            "::127.0.0.1",
+            "::10.0.0.1",
+            "::8.8.8.8",
+            "::0.0.0.2",
+        ] {
             assert!(!public(ip), "{ip} should be refused");
         }
     }
@@ -324,7 +391,22 @@ mod tests {
         assert_eq!(t("1.2.3.4:443"), Some(("1.2.3.4".into(), 443)));
         assert_eq!(t("[2606:4700::1111]:443"), Some(("2606:4700::1111".into(), 443)));
         assert_eq!(t("example.com:8443"), Some(("example.com".into(), 8443)));
-        for bad in ["example.com", "example.com:", "example.com:abc", "example.com:99999", ":443", "[::1:443", "::1:443", "a b.com:443", "a/b.com:443", "user@evil.com:443", "exa%6dple.com:443", "..:443", "a..b:443", "-.com:443x"] {
+        for bad in [
+            "example.com",
+            "example.com:",
+            "example.com:abc",
+            "example.com:99999",
+            ":443",
+            "[::1:443",
+            "::1:443",
+            "a b.com:443",
+            "a/b.com:443",
+            "user@evil.com:443",
+            "exa%6dple.com:443",
+            "..:443",
+            "a..b:443",
+            "-.com:443x",
+        ] {
             assert_eq!(t(bad), None, "{bad}");
         }
     }

@@ -123,8 +123,7 @@ impl World for Real {
     }
 
     fn key(&self, name: &str) -> Result<String> {
-        keychain::get(&super::key(name), super::KEY_FIELD)
-            .ok_or_else(|| anyhow!("the key of box {name} isn't in the Keychain, so its store can't be opened (cred box rm {name})"))
+        keychain::get(&super::key(name), super::KEY_FIELD).ok_or_else(|| anyhow!("the key of box {name} isn't in the Keychain, so its store can't be opened (cred box rm {name})"))
     }
 
     fn record_sessions(&self, name: &str, sites: &[String]) -> Result<()> {
@@ -188,11 +187,7 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
         // The door of the open box keeps the rules it started with, so joining under a policy
         // approved since would promise rules nothing enforces.
         if fs::read_to_string(layout.opened_with(&req.id)).ok().as_deref() != Some(req.policy_sha.as_str()) {
-            bail!(
-                "box {} runs with the policy it was opened with, not the one approved since: stop it (cred box stop {}) and run it again",
-                req.name,
-                req.name
-            );
+            bail!("box {} runs with the policy it was opened with, not the one approved since: stop it (cred box stop {}) and run it again", req.name, req.name);
         }
         return exit_code(world.exec(&vm, &agent_env()?, &command, req.tty)?);
     };
@@ -236,7 +231,7 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
     let ca = Arc::new(box_ca(&mnt, req.name, &key, req.persistent)?);
     let sessions = Sessions::new(&mnt, &key, policy.browser.keep_sessions);
     let sealed_sites = Sessions::new(&mnt, &key, true);
-        let _ = store::log_event(&mnt, &log_key, "box", &req.id, 0, "started");
+    let _ = store::log_event(&mnt, &log_key, "box", &req.id, 0, "started");
 
     // The folders are changed here, while no VM has them.
     prepare_home(&mnt.join("home"))?;
@@ -273,15 +268,8 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
         }
         None => (None, Box::new(|_| bail!("this box has no sites to browse"))),
     };
-    let spec = engine::VmSpec {
-        name: vm.clone(),
-        image: image.to_string(),
-        cpus: policy.cpus,
-        memory: policy.memory.clone(),
-        socket: socket.clone(),
-        mounts,
-        docker: policy.docker,
-    };
+    let spec =
+        engine::VmSpec { name: vm.clone(), image: image.to_string(), cpus: policy.cpus, memory: policy.memory.clone(), socket: socket.clone(), mounts, docker: policy.docker };
     let config = door::Config {
         name: req.id.clone(),
         socket: socket.clone(),
@@ -779,7 +767,18 @@ mod tests {
         assert_eq!(code, 0);
         assert_eq!(
             fake.calls(),
-            ["available", "bearer: anthropic", "site: anthropic", "site: github", "confirm: open box r and let it use github", "start_vm", "start_door", "install_ca", "exec", "stop_vm"]
+            [
+                "available",
+                "bearer: anthropic",
+                "site: anthropic",
+                "site: github",
+                "confirm: open box r and let it use github",
+                "start_vm",
+                "start_door",
+                "install_ca",
+                "exec",
+                "stop_vm"
+            ]
         );
         assert_put_away(&s);
         assert!(!stale.exists(), "leftovers of crashed runs are cleared");

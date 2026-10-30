@@ -600,16 +600,8 @@ fn box_new_refuses_policies_the_door_cannot_keep() {
 /// is a line of its output after which the "person" presses Enter in the terminal.
 fn box_login(env: &Env, args: &[&str], enter_at: Option<&str>) -> (Output, String) {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-runner.mjs");
-    let mut child = env
-        .command()
-        .args(["box", "login"])
-        .args(args)
-        .env("CRED_TEST_LOGIN_RUNNER", script)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child =
+        env.command().args(["box", "login"]).args(args).env("CRED_TEST_LOGIN_RUNNER", script).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let mut shown = String::new();
     let mut lines = BufReader::new(child.stdout.take().unwrap());
@@ -734,7 +726,10 @@ fn box_import_export_and_log_go_through_touch_id_and_stay_in_the_box() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(stdout(&out).contains("work/note.txt"), "{}", stdout(&out));
     assert!(!env.dir.join("home/Library/Application Support/cred/box/open/research").exists(), "the store is closed again");
-    assert!(!fs::read_dir(env.box_store("research").join("bands")).unwrap().any(|b| fs::read(b.unwrap().path()).unwrap().windows(9).any(|w| w == b"hello box")), "ciphertext at rest");
+    assert!(
+        !fs::read_dir(env.box_store("research").join("bands")).unwrap().any(|b| fs::read(b.unwrap().path()).unwrap().windows(9).any(|w| w == b"hello box")),
+        "ciphertext at rest"
+    );
 
     let out_dir = env.dir.join("out");
     fs::create_dir(&out_dir).unwrap();
@@ -878,8 +873,7 @@ fn browser_opens_a_page_signed_in_and_masks_it() {
     );
     let runner = env::var("CRED_RUNNER_DIR").unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("runner").display().to_string());
     // The test's HOME is empty, so Playwright must be told where the real one keeps Chromium.
-    let browsers = env::var("PLAYWRIGHT_BROWSERS_PATH")
-        .unwrap_or_else(|_| format!("{}/Library/Caches/ms-playwright", env::var("HOME").unwrap()));
+    let browsers = env::var("PLAYWRIGHT_BROWSERS_PATH").unwrap_or_else(|_| format!("{}/Library/Caches/ms-playwright", env::var("HOME").unwrap()));
     let mut mcp = Mcp::start(env.command().arg("mcp").env("CRED_RUNNER_DIR", runner).env("PLAYWRIGHT_BROWSERS_PATH", browsers));
     mcp.handshake();
     assert!(mcp.tool_names().contains(&"browse_open".to_string()));

@@ -8,9 +8,7 @@ use std::{fs, path::PathBuf};
 use anyhow::{Context, Result};
 use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
 use security_framework::os::macos::keychain::SecKeychain;
-use security_framework::passwords::{
-    delete_generic_password, get_generic_password, set_generic_password,
-};
+use security_framework::passwords::{delete_generic_password, get_generic_password, set_generic_password};
 
 const PREFIX: &str = "cred:";
 
@@ -34,9 +32,7 @@ pub fn get(res: &str, field: &str) -> Option<String> {
     if let Some(file) = fake(res, field) {
         return fs::read_to_string(file).ok();
     }
-    get_generic_password(&service(res, field), &account())
-        .ok()
-        .map(|v| String::from_utf8_lossy(&v).into_owned())
+    get_generic_password(&service(res, field), &account()).ok().map(|v| String::from_utf8_lossy(&v).into_owned())
 }
 
 /// Read an item only if macOS lets cred do so without asking. Approval records are read this
@@ -79,8 +75,7 @@ pub fn set(res: &str, field: &str, value: &str) -> Result<()> {
         return fs::write(file, value).with_context(|| format!("storing {res}/{field}"));
     }
     // Updates in place if the item exists, so rotation keeps the same Keychain item.
-    set_generic_password(&service(res, field), &account(), value.as_bytes())
-        .with_context(|| format!("storing {res}/{field} in Keychain"))
+    set_generic_password(&service(res, field), &account(), value.as_bytes()).with_context(|| format!("storing {res}/{field} in Keychain"))
 }
 
 /// Store the value in a new item, so its access list names only the cred running now.

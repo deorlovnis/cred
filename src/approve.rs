@@ -40,18 +40,11 @@ fn prompt(reason: &str) -> Result<()> {
     let context = unsafe { LAContext::new() };
     let (tx, rx) = mpsc::channel();
     let reply = RcBlock::new(move |ok: Bool, error: *mut NSError| {
-        let failure = (!ok.as_bool()).then(|| {
-            unsafe { error.as_ref() }
-                .map_or("cancelled".to_string(), |e| e.localizedDescription().to_string())
-        });
+        let failure = (!ok.as_bool()).then(|| unsafe { error.as_ref() }.map_or("cancelled".to_string(), |e| e.localizedDescription().to_string()));
         let _ = tx.send(failure);
     });
     unsafe {
-        context.evaluatePolicy_localizedReason_reply(
-            LAPolicy::DeviceOwnerAuthentication,
-            &NSString::from_str(reason),
-            &reply,
-        );
+        context.evaluatePolicy_localizedReason_reply(LAPolicy::DeviceOwnerAuthentication, &NSString::from_str(reason), &reply);
     }
     match rx.recv_timeout(TIMEOUT) {
         Ok(None) => Ok(()),

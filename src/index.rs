@@ -85,8 +85,7 @@ impl Field {
 
     /// When it expires, comparable across exact and date-only expiries.
     pub fn expiry_key(&self) -> Option<Timestamp> {
-        self.expires_at
-            .or_else(|| self.expires?.to_zoned(TimeZone::system()).ok().map(|z| z.timestamp()))
+        self.expires_at.or_else(|| self.expires?.to_zoned(TimeZone::system()).ok().map(|z| z.timestamp()))
     }
 
     pub fn expiry_text(&self) -> Option<String> {

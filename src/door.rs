@@ -402,12 +402,12 @@ impl Log {
 }
 
 #[cfg(test)]
+mod inspect_tests;
+#[cfg(test)]
 mod intercept_tests;
 #[cfg(test)]
 mod page_tests;
 #[cfg(test)]
 mod page_vm_tests;
-#[cfg(test)]
-mod inspect_tests;
 #[cfg(test)]
 mod tests;

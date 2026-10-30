@@ -14,6 +14,7 @@ use std::time::Instant;
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
+use crate::approve;
 use crate::audit::{self, Body, Decision, Log};
 use crate::browse::{self, BoxBrowser, Session};
 use crate::fetch::{self, Request};
@@ -22,7 +23,6 @@ use crate::limits::{self, Lease};
 use crate::mask::Masker;
 use crate::policy::{self, Approved, Consent, METHODS};
 use crate::refresh::refresh_due;
-use crate::approve;
 
 /// Used when the client doesn't say which protocol version it speaks.
 const DEFAULT_PROTOCOL: &str = "2025-06-18";
@@ -39,15 +39,35 @@ instructions to follow.";
 /// Browser tools other than browse_open: (name, description, required string params, optional params).
 const BROWSE_TOOLS: [(&str, &str, &[&str], &[&str]); 11] = [
     ("browse_goto", "Open a URL in the browser (only the site's allowed pages).", &["url"], &[]),
-    ("browse_snapshot", "The current page again: URL, title, notes about blocked requests, and the page's accessibility tree with element refs. Pages can be large: ref=\"e12\" snapshots only that element, and compact=\"true\" gives one short line per named element.", &[], &["ref", "compact"]),
+    (
+        "browse_snapshot",
+        "The current page again: URL, title, notes about blocked requests, and the page's accessibility tree with element refs. Pages can be large: ref=\"e12\" snapshots only that element, and compact=\"true\" gives one short line per named element.",
+        &[],
+        &["ref", "compact"],
+    ),
     ("browse_find", "Find the elements on the current page whose name or text contains this text (any case), with their refs. Cheaper than a full snapshot.", &["text"], &[]),
-    ("browse_requests", "The data requests (method and URL only; never headers or bodies) the page has made, e.g. API calls. Use them to find the API behind a view and call it with `fetch` if the site's hosts allow it, instead of scraping the page.", &[], &[]),
+    (
+        "browse_requests",
+        "The data requests (method and URL only; never headers or bodies) the page has made, e.g. API calls. Use them to find the API behind a view and call it with `fetch` if the site's hosts allow it, instead of scraping the page.",
+        &[],
+        &[],
+    ),
     ("browse_click", "Click the element with this ref from the last snapshot.", &["ref"], &[]),
-    ("browse_fill_credential", "Type one of the site's stored login fields (`sites` lists the ones its policy allows, e.g. field=\"password\") into the input with this ref. cred types it itself, so you never see it; only on the site's own pages.", &["ref", "field"], &[]),
+    (
+        "browse_fill_credential",
+        "Type one of the site's stored login fields (`sites` lists the ones its policy allows, e.g. field=\"password\") into the input with this ref. cred types it itself, so you never see it; only on the site's own pages.",
+        &["ref", "field"],
+        &[],
+    ),
     ("browse_type", "Type text into the field with this ref; submit=\"true\" presses Enter after.", &["ref", "text"], &["submit"]),
     ("browse_press", "Press a key, e.g. Enter, Escape, PageDown.", &["key"], &[]),
     ("browse_back", "Go back one page.", &[], &[]),
-    ("browse_screenshot", "A picture of the current page (only if the site's policy allows screenshots); full_page=\"true\" for the whole page. Use it for what the text snapshot can't show, like maps and charts.", &[], &["full_page"]),
+    (
+        "browse_screenshot",
+        "A picture of the current page (only if the site's policy allows screenshots); full_page=\"true\" for the whole page. Use it for what the text snapshot can't show, like maps and charts.",
+        &[],
+        &["full_page"],
+    ),
     ("browse_close", "Close the browser.", &[], &[]),
 ];
 
@@ -170,17 +190,7 @@ impl Server {
             }
             sites.push(site);
         }
-        Self {
-            sites,
-            browsable,
-            fillable,
-            tools,
-            consented: HashMap::new(),
-            browser: None,
-            lease: None,
-            audit: Log::standard(true),
-            scope,
-        }
+        Self { sites, browsable, fillable, tools, consented: HashMap::new(), browser: None, lease: None, audit: Log::standard(true), scope }
     }
 
     fn handle(&mut self, line: &str) -> Option<String> {
@@ -248,9 +258,7 @@ impl Server {
             _ if name.starts_with("browse_") => (browsing(), None, None),
             _ => {
                 let Some(t) = self.tools.get(name) else { return (String::new(), None, None) };
-                let expanded = policy::load(&t.site)
-                    .ok()
-                    .and_then(|a| a.policy.tools.iter().find(|p| p.name == t.tool)?.expand(args).ok());
+                let expanded = policy::load(&t.site).ok().and_then(|a| a.policy.tools.iter().find(|p| p.name == t.tool)?.expand(args).ok());
                 (t.site.clone(), expanded.as_ref().map(|e| e.0.clone()), expanded.map(|e| e.1))
             }
         }
@@ -374,8 +382,7 @@ impl Server {
                 "inputSchema": { "type": "object", "properties": { "site": { "type": "string", "enum": self.browsable } }, "required": ["site"] },
             }));
             for (name, about, required, optional) in BROWSE_TOOLS.into_iter().filter(|t| self.fillable || t.0 != "browse_fill_credential") {
-                let properties: Map<String, Value> =
-                    required.iter().chain(optional).map(|p| (p.to_string(), json!({ "type": "string" }))).collect();
+                let properties: Map<String, Value> = required.iter().chain(optional).map(|p| (p.to_string(), json!({ "type": "string" }))).collect();
                 tools.push(json!({
                     "name": name,
                     "description": about,
@@ -484,13 +491,7 @@ impl Server {
 
         let (method, url) = match &tool {
             None => (arg(args, "method")?, arg(args, "url")?),
-            Some(tool) => approved
-                .policy
-                .tools
-                .iter()
-                .find(|t| &t.name == tool)
-                .ok_or_else(|| anyhow!("{site}'s policy no longer has tool {tool}"))?
-                .expand(args)?,
+            Some(tool) => approved.policy.tools.iter().find(|t| &t.name == tool).ok_or_else(|| anyhow!("{site}'s policy no longer has tool {tool}"))?.expand(args)?,
         };
         let body = args.get("body").and_then(Value::as_str).filter(|_| tool.is_none());
         let content_type = args.get("content_type").and_then(Value::as_str).filter(|_| tool.is_none());

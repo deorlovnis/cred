@@ -127,7 +127,10 @@ fn write_policy(res: &str, toml: &str) {
 // --- the scenario ---
 
 fn scenario(dir: &Path, yes: bool) {
-    write_policy("app", "[fetch]\nhosts = [\"https://app.example.com\"]\nauth = \"Bearer {token}\"\n\n[browse]\norigins = [\"https://app.example.com\"]\nrequests = [\"https://cdn.example.com\"]\nallow_writes = [\"https://app.example.com/telemetry\"]\n");
+    write_policy(
+        "app",
+        "[fetch]\nhosts = [\"https://app.example.com\"]\nauth = \"Bearer {token}\"\n\n[browse]\norigins = [\"https://app.example.com\"]\nrequests = [\"https://cdn.example.com\"]\nallow_writes = [\"https://app.example.com/telemetry\"]\n",
+    );
     write_policy("loose", "[browse]\norigins = [\"https://loose.example.com\"]\nwrites = \"allow\"\n");
     write_policy("askme", "[browse]\norigins = [\"https://ask.example.com\"]\nwrites = \"ask\"\n");
     write_policy("fetchonly", "[fetch]\nhosts = [\"https://fetch.example.com\"]\n");
@@ -285,7 +288,10 @@ fn scenario(dir: &Path, yes: bool) {
     let (status, body) = call(&mut as_agent, "app.example.com", "POST", "/telemetry/ping", "x");
     assert!(status == 403 && body.contains("the policy for app doesn't allow"), "the agent gets the fetch rules, not the browse rules: {status} {body}");
     let with_credentials = reached.lock().unwrap().iter().rfind(|(h, line, _)| h == "app.example.com" && line == "GET /hello HTTP/1.1").unwrap().2.clone();
-    assert!(with_credentials.iter().any(|(n, v)| n.eq_ignore_ascii_case("authorization") && v == &format!("Bearer {SECRET}")), "the agent gets the site's credentials: {with_credentials:?}");
+    assert!(
+        with_credentials.iter().any(|(n, v)| n.eq_ignore_ascii_case("authorization") && v == &format!("Bearer {SECRET}")),
+        "the agent gets the site's credentials: {with_credentials:?}"
+    );
     drop(as_agent);
 
     // The browser's VM has no business with cred itself or MCP.

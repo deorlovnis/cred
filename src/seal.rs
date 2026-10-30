@@ -32,9 +32,7 @@ pub fn seal(key: &[u8; 32], purpose: &str, plaintext: &[u8]) -> Vec<u8> {
     let mut nonce = [0u8; NONCE];
     File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut nonce)).expect("reading /dev/urandom");
     let cipher = XChaCha20Poly1305::new(key.into());
-    let sealed = cipher
-        .encrypt(&XNonce::from(nonce), Payload { msg: plaintext, aad: purpose.as_bytes() })
-        .expect("encrypting in memory");
+    let sealed = cipher.encrypt(&XNonce::from(nonce), Payload { msg: plaintext, aad: purpose.as_bytes() }).expect("encrypting in memory");
     [nonce.as_slice(), &sealed].concat()
 }
 

@@ -7,11 +7,8 @@ use rustls::StreamOwned;
 use super::*;
 
 fn guest_config(ca: &BoxCa, alpn: &[&[u8]]) -> Arc<ClientConfig> {
-    let mut config = ClientConfig::builder_with_provider(provider())
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(trust_only(&ca.cert_pem()))
-        .with_no_client_auth();
+    let mut config =
+        ClientConfig::builder_with_provider(provider()).with_safe_default_protocol_versions().unwrap().with_root_certificates(trust_only(&ca.cert_pem())).with_no_client_auth();
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     Arc::new(config)
 }

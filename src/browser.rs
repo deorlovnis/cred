@@ -60,8 +60,7 @@ impl Source {
             Kind::FirefoxCookie => ("Firefox", firefox_cookies(&firefox_profile()?.join("cookies.sqlite"), &self.key)?),
             Kind::ChromeCookie => {
                 // macOS asks the user before cred may read this item.
-                let password = keychain::get_app_password("Chrome Safe Storage", "Chrome")
-                    .context("reading the Chrome Safe Storage password from the Keychain")?;
+                let password = keychain::get_app_password("Chrome Safe Storage", "Chrome").context("reading the Chrome Safe Storage password from the Keychain")?;
                 ("Chrome", chrome_cookies(&chrome_cookie_db()?, &self.key, &chrome_key(&password))?)
             }
         };
@@ -96,12 +95,7 @@ impl Source {
         }
         keys.sort();
         keys.dedup();
-        bail!(
-            "Firefox Local Storage for {} has no key '{}' (keys there: {})",
-            self.origin,
-            self.key,
-            if keys.is_empty() { "none".into() } else { keys.join(", ") }
-        )
+        bail!("Firefox Local Storage for {} has no key '{}' (keys there: {})", self.origin, self.key, if keys.is_empty() { "none".into() } else { keys.join(", ") })
     }
 }
 
@@ -110,8 +104,7 @@ fn firefox_profile() -> Result<PathBuf> {
     if let Some(p) = env::var_os("CRED_FIREFOX_PROFILE") {
         return Ok(p.into());
     }
-    let root = PathBuf::from(env::var_os("HOME").unwrap_or_default())
-        .join("Library/Application Support/Firefox");
+    let root = PathBuf::from(env::var_os("HOME").unwrap_or_default()).join("Library/Application Support/Firefox");
     let ini = fs::read_to_string(root.join("profiles.ini")).context("reading Firefox profiles.ini")?;
     let rel = default_profile(&ini).context("no profile in Firefox profiles.ini")?;
     // Paths in profiles.ini are relative to it unless absolute.
@@ -119,8 +112,7 @@ fn firefox_profile() -> Result<PathBuf> {
 }
 
 fn default_profile(ini: &str) -> Option<String> {
-    let (mut section, mut install_default, mut marked_default, mut first) =
-        (String::new(), None, None, None);
+    let (mut section, mut install_default, mut marked_default, mut first) = (String::new(), None, None, None);
     let mut path: Option<String> = None;
     for line in ini.lines().map(str::trim) {
         if line.starts_with('[') {
@@ -157,17 +149,14 @@ fn open_copy(db: &Path) -> Result<(Connection, TempDir)> {
             fs::copy(&src, tmp.0.join(format!("{name}{suffix}"))).with_context(|| format!("copying {}", src.display()))?;
         }
     }
-    let conn = Connection::open_with_flags(tmp.0.join(&name), OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .with_context(|| format!("opening a copy of {}", db.display()))?;
+    let conn = Connection::open_with_flags(tmp.0.join(&name), OpenFlags::SQLITE_OPEN_READ_WRITE).with_context(|| format!("opening a copy of {}", db.display()))?;
     Ok((conn, tmp))
 }
 
 /// Look KEY up in Firefox's Local Storage database.
 fn read_key(db: &Path, key: &str) -> Result<Lookup> {
     let (conn, _tmp) = open_copy(db)?;
-    let mut stmt = conn
-        .prepare("SELECT key, conversion_type, compression_type, value FROM data")
-        .context("reading Firefox Local Storage (unknown schema)")?;
+    let mut stmt = conn.prepare("SELECT key, conversion_type, compression_type, value FROM data").context("reading Firefox Local Storage (unknown schema)")?;
     let mut rows = stmt.query([])?;
     let mut keys = Vec::new();
     while let Some(row) = rows.next()? {
@@ -183,11 +172,7 @@ fn read_key(db: &Path, key: &str) -> Result<Lookup> {
 
 /// Firefox stores values as UTF-8 (conversion 1) or UTF-16LE (0), optionally snappy-compressed (compression 1).
 fn decode(conversion: i64, compression: i64, bytes: &[u8]) -> Result<String> {
-    let raw = if compression == 1 {
-        snap::raw::Decoder::new().decompress_vec(bytes).context("decompressing Firefox value")?
-    } else {
-        bytes.to_vec()
-    };
+    let raw = if compression == 1 { snap::raw::Decoder::new().decompress_vec(bytes).context("decompressing Firefox value")? } else { bytes.to_vec() };
     if conversion == 1 {
         return String::from_utf8(raw).context("Firefox value is not UTF-8");
     }
@@ -228,9 +213,7 @@ fn cookie_covers(cookie_host: &str, host: &str) -> bool {
 
 fn firefox_cookies(db: &Path, name: &str) -> Result<Vec<Cookie>> {
     let (conn, _tmp) = open_copy(db)?;
-    let mut stmt = conn
-        .prepare("SELECT host, path, value, expiry, originAttributes FROM moz_cookies WHERE name = ?1")
-        .context("reading Firefox cookies (unknown schema)")?;
+    let mut stmt = conn.prepare("SELECT host, path, value, expiry, originAttributes FROM moz_cookies WHERE name = ?1").context("reading Firefox cookies (unknown schema)")?;
     let rows = stmt.query_map([name], |row| {
         // Seconds, though some Firefox versions have stored milliseconds.
         let expiry: i64 = row.get(3)?;
@@ -247,13 +230,8 @@ fn firefox_cookies(db: &Path, name: &str) -> Result<Vec<Cookie>> {
 
 /// Chrome's cookie database; CRED_CHROME_PROFILE overrides the default profile folder.
 fn chrome_cookie_db() -> Result<PathBuf> {
-    let profile = env::var_os("CRED_CHROME_PROFILE")
-        .map_or_else(|| home().join("Library/Application Support/Google/Chrome/Default"), PathBuf::from);
-    ["Network/Cookies", "Cookies"]
-        .iter()
-        .map(|p| profile.join(p))
-        .find(|p| p.is_file())
-        .ok_or_else(|| anyhow!("Chrome has no Cookies database in {}", profile.display()))
+    let profile = env::var_os("CRED_CHROME_PROFILE").map_or_else(|| home().join("Library/Application Support/Google/Chrome/Default"), PathBuf::from);
+    ["Network/Cookies", "Cookies"].iter().map(|p| profile.join(p)).find(|p| p.is_file()).ok_or_else(|| anyhow!("Chrome has no Cookies database in {}", profile.display()))
 }
 
 /// Chrome on macOS encrypts cookies with AES-128-CBC; the key comes from the Safe Storage
@@ -266,9 +244,7 @@ fn chrome_key(password: &[u8]) -> [u8; 16] {
 
 fn chrome_cookies(db: &Path, name: &str, key: &[u8; 16]) -> Result<Vec<Cookie>> {
     let (conn, _tmp) = open_copy(db)?;
-    let mut stmt = conn
-        .prepare("SELECT host_key, path, value, encrypted_value, expires_utc FROM cookies WHERE name = ?1")
-        .context("reading Chrome cookies (unknown schema)")?;
+    let mut stmt = conn.prepare("SELECT host_key, path, value, encrypted_value, expires_utc FROM cookies WHERE name = ?1").context("reading Chrome cookies (unknown schema)")?;
     let mut rows = stmt.query([name])?;
     let mut cookies = Vec::new();
     while let Some(row) = rows.next()? {
@@ -385,8 +361,8 @@ mod tests {
     // printf 'cookie-value-123' | openssl enc -aes-128-cbc -K <key> -iv 20202020202020202020202020202020
     const PEANUTS_KEY: [u8; 16] = [0xd9, 0xa0, 0x9d, 0x49, 0x9b, 0x4e, 0x1b, 0x74, 0x61, 0xf2, 0x8e, 0x67, 0x97, 0x2c, 0x6d, 0xbd];
     const PEANUTS_COOKIE: [u8; 32] = [
-        0xfa, 0xcc, 0x06, 0x07, 0x80, 0x78, 0xee, 0xb9, 0xe7, 0xbf, 0x83, 0x51, 0xe8, 0x7a, 0x87, 0x5d, 0xb4, 0xd1, 0x28, 0x73,
-        0xea, 0x58, 0x8d, 0xa0, 0xb5, 0xe0, 0x7a, 0xfa, 0x24, 0x54, 0x69, 0x38,
+        0xfa, 0xcc, 0x06, 0x07, 0x80, 0x78, 0xee, 0xb9, 0xe7, 0xbf, 0x83, 0x51, 0xe8, 0x7a, 0x87, 0x5d, 0xb4, 0xd1, 0x28, 0x73, 0xea, 0x58, 0x8d, 0xa0, 0xb5, 0xe0, 0x7a, 0xfa,
+        0x24, 0x54, 0x69, 0x38,
     ];
 
     #[test]

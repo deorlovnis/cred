@@ -7,11 +7,11 @@
 //! last breaks the chain from there on, which `cred audit --verify` reports. Cutting off the
 //! end of the log can't be seen: there is no later line to notice it.
 
+#[cfg(debug_assertions)]
+use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
-#[cfg(debug_assertions)]
-use std::env;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -35,8 +35,7 @@ const MAX_URL: usize = 300;
 /// Query values and path segments at least this long, made of token characters, look like secrets.
 const OPAQUE_LEN: usize = 20;
 /// Query keys containing one of these have their value masked whatever it looks like.
-const SENSITIVE_KEYS: [&str; 14] =
-    ["token", "key", "secret", "pass", "pwd", "auth", "sig", "code", "session", "cred", "jwt", "bearer", "otp", "sid"];
+const SENSITIVE_KEYS: [&str; 14] = ["token", "key", "secret", "pass", "pwd", "auth", "sig", "code", "session", "cred", "jwt", "bearer", "otp", "sid"];
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
 pub enum Decision {
@@ -173,9 +172,7 @@ fn keychain_key(create: bool) -> Result<Vec<u8>> {
         return Ok(key.into_bytes());
     }
     if keychain::exists(KEY_RES, KEY_FIELD) {
-        return keychain::get(KEY_RES, KEY_FIELD)
-            .map(String::into_bytes)
-            .ok_or_else(|| anyhow!("can't read the audit key from the Keychain"));
+        return keychain::get(KEY_RES, KEY_FIELD).map(String::into_bytes).ok_or_else(|| anyhow!("can't read the audit key from the Keychain"));
     }
     if !create {
         bail!("the audit key isn't in the Keychain, so the log can't be verified");
@@ -220,13 +217,7 @@ impl Log {
         if let Some(dir) = self.path.parent() {
             fs::create_dir_all(dir)?;
         }
-        let file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create(true)
-            .mode(0o600)
-            .open(&self.path)
-            .with_context(|| format!("opening {}", self.path.display()))?;
+        let file = OpenOptions::new().read(true).append(true).create(true).mode(0o600).open(&self.path).with_context(|| format!("opening {}", self.path.display()))?;
         file.lock()?;
         Ok(file)
     }
@@ -324,15 +315,9 @@ mod tests {
 
     #[test]
     fn hmac_matches_rfc_4231() {
-        assert_eq!(
-            hmac_sha256(b"Jefe", &[b"what do ya ", b"want for nothing?"]),
-            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
-        );
+        assert_eq!(hmac_sha256(b"Jefe", &[b"what do ya ", b"want for nothing?"]), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
         // A key longer than the block is hashed first (test case 6).
-        assert_eq!(
-            hmac_sha256(&[0xaa; 131], &[b"Test Using Larger Than Block-Size Key - Hash Key First"]),
-            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
-        );
+        assert_eq!(hmac_sha256(&[0xaa; 131], &[b"Test Using Larger Than Block-Size Key - Hash Key First"]), "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
     }
 
     #[test]

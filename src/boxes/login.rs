@@ -32,11 +32,7 @@ pub struct Window<'a> {
 pub fn sign_in_sites(sessions: &Sessions, sites: &[(String, Policy)], window: &mut Window) -> Result<Vec<String>> {
     let (mut sealed, mut failed) = (Vec::new(), 0);
     for (n, (site, policy)) in sites.iter().enumerate() {
-        (window.say)(&format!(
-            "signing in to {site} ({} of {}): close the window when done (Enter in this terminal also finishes, Ctrl-C skips this site)",
-            n + 1,
-            sites.len()
-        ));
+        (window.say)(&format!("signing in to {site} ({} of {}): close the window when done (Enter in this terminal also finishes, Ctrl-C skips this site)", n + 1, sites.len()));
         let outcome = (|| {
             let start = browse::login_start(site, policy)?;
             browse::sign_in(site, policy, &start, (window.spawn)()?, window.headed, &mut *window.stop)
@@ -108,11 +104,7 @@ pub fn login(name: &str, only: Option<&str>, all: bool) -> Result<()> {
             None => pick(name, &box_policy, None, all, &sessions.sites())?,
         };
         if sites.is_empty() {
-            let why = if all {
-                "has no sites that allow browsing"
-            } else {
-                "has no site that allows browsing and still needs a session (--all signs in again to every one)"
-            };
+            let why = if all { "has no sites that allow browsing" } else { "has no site that allows browsing and still needs a session (--all signs in again to every one)" };
             println!("box {name} {why}");
             return Ok(());
         }
@@ -211,11 +203,8 @@ mod tests {
         let sites: Vec<(String, Policy)> = sites.iter().map(|(name, page)| (name.to_string(), site(page))).collect();
         let mut said = Vec::new();
         stops.reverse();
-        let result = sign_in_sites(
-            &sessions,
-            &sites,
-            &mut Window { spawn: &fake, headed: false, stop: &mut || stops.pop().flatten(), say: &mut |line| said.push(line.to_string()) },
-        );
+        let result =
+            sign_in_sites(&sessions, &sites, &mut Window { spawn: &fake, headed: false, stop: &mut || stops.pop().flatten(), say: &mut |line| said.push(line.to_string()) });
         (result, said, sessions)
     }
 
@@ -279,14 +268,19 @@ mod tests {
                 use std::io::{Read, Write};
                 let _ = stream.read(&mut [0u8; 4096]);
                 let body = "<html><body><script>localStorage.setItem('jwt','LOCAL-VALUE-0123')</script>hi</body></html>";
-                let _ = write!(stream, "HTTP/1.1 200 OK\r\nSet-Cookie: sid=HAND-MADE-0123; Path=/\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nSet-Cookie: sid=HAND-MADE-0123; Path=/\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
             }
         });
         let policy = Policy::parse(&format!("[browse]\norigins = [\"http://127.0.0.1:{port}\"]\nstart = \"http://127.0.0.1:{port}/\"\n")).unwrap();
         let runner = Path::new(env!("CARGO_MANIFEST_DIR")).join("runner/runner.mjs");
         let child = Command::new("node").arg(runner).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
         let begun = std::time::Instant::now();
-        let state = browse::sign_in("app", &policy, &format!("http://127.0.0.1:{port}/"), child, false, || (begun.elapsed().as_secs() >= 3).then_some(Stop::Done)).unwrap().unwrap();
+        let state =
+            browse::sign_in("app", &policy, &format!("http://127.0.0.1:{port}/"), child, false, || (begun.elapsed().as_secs() >= 3).then_some(Stop::Done)).unwrap().unwrap();
         assert_eq!(state["cookies"][0]["value"], "HAND-MADE-0123");
         assert_eq!(state["origins"][0]["localStorage"][0]["value"], "LOCAL-VALUE-0123");
     }

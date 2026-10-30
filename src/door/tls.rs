@@ -17,10 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
-    KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
-};
+use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256};
 use rustls::crypto::{CryptoProvider, ring};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, Connection, RootCertStore, ServerConfig, ServerConnection};
@@ -146,10 +143,8 @@ impl BoxCa {
         params.not_after = days_from_now(LEAF_DAYS);
         let cert = params.signed_by(&key, &self.issuer)?;
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
-        let mut config = ServerConfig::builder_with_provider(provider())
-            .with_safe_default_protocol_versions()?
-            .with_no_client_auth()
-            .with_single_cert(vec![cert.der().clone()], key)?;
+        let mut config =
+            ServerConfig::builder_with_provider(provider()).with_safe_default_protocol_versions()?.with_no_client_auth().with_single_cert(vec![cert.der().clone()], key)?;
         config.alpn_protocols = vec![ALPN.to_vec()];
         Ok(config)
     }

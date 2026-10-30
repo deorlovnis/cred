@@ -483,7 +483,10 @@ fn request_headers(head: &Head, framing: Framing, method: &str, site: Option<&Si
 enum Failure {
     /// The guest's side broke: nothing more can be said to it.
     Guest(io::Error),
-    Site { decision: &'static str, message: &'static str },
+    Site {
+        decision: &'static str,
+        message: &'static str,
+    },
 }
 
 fn site_failure(decision: &'static str, message: &'static str) -> Failure {
@@ -506,7 +509,11 @@ fn read_answer<U: Read + Write>(upstream: &mut BufReader<U>) -> Answer {
             Ok(Some(h)) if h.status().is_some_and(|s| (100..200).contains(&s)) && h.status() != Some(101) => interim = true,
             Ok(Some(h)) if h.status().is_some() && h.status() != Some(101) => return Answer::Head(h),
             Ok(None) if !interim => return Answer::Gone,
-            Err(e) if !interim && matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted | io::ErrorKind::BrokenPipe | io::ErrorKind::NotConnected) => return Answer::Gone,
+            Err(e)
+                if !interim && matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted | io::ErrorKind::BrokenPipe | io::ErrorKind::NotConnected) =>
+            {
+                return Answer::Gone;
+            }
             _ => return Answer::Broken,
         }
     }
@@ -826,7 +833,17 @@ mod tests {
         for ok in ["https://api.example.com", "https://api.example.com/", "https://api.example.com/a/b", "https://API.example.com/a"] {
             assert!(parse_prefix(ok).is_ok(), "{ok}");
         }
-        for bad in ["http://api.example.com/a", "api.example.com/a", "https://*.example.com/a", "https://api.example.com:8443/a", "https://u:p@api.example.com/", "https://api.example.com/a?x=1", "https://api.example.com/a#f", "*", ""] {
+        for bad in [
+            "http://api.example.com/a",
+            "api.example.com/a",
+            "https://*.example.com/a",
+            "https://api.example.com:8443/a",
+            "https://u:p@api.example.com/",
+            "https://api.example.com/a?x=1",
+            "https://api.example.com/a#f",
+            "*",
+            "",
+        ] {
             assert!(parse_prefix(bad).is_err(), "{bad}");
         }
         // An explicit default port is the same host.

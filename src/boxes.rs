@@ -205,10 +205,7 @@ pub fn mount_problem(path: &Path) -> Option<String> {
     if path == Path::new("/") || path == home() {
         return Some("is too broad".into());
     }
-    [config_dir(), home().join("Library/Application Support/cred")]
-        .iter()
-        .any(|own| path.starts_with(own) || own.starts_with(path))
-        .then(|| "holds cred's own files".into())
+    [config_dir(), home().join("Library/Application Support/cred")].iter().any(|own| path.starts_with(own) || own.starts_with(path)).then(|| "holds cred's own files".into())
 }
 
 impl BoxPolicy {
@@ -381,8 +378,7 @@ pub fn approve(names_given: &[String]) -> Result<()> {
 
 /// The box's store key, from the Keychain.
 fn box_key(name: &str) -> Result<String> {
-    keychain::get(&key(name), KEY_FIELD)
-        .ok_or_else(|| anyhow!("the key of box {name} isn't in the Keychain, so its store can't be opened (cred box rm {name})"))
+    keychain::get(&key(name), KEY_FIELD).ok_or_else(|| anyhow!("the key of box {name} isn't in the Keychain, so its store can't be opened (cred box rm {name})"))
 }
 
 // STUB: replaced at merge by seal::derive (one key per purpose, derived from the box key)
@@ -723,9 +719,7 @@ pub fn ls() -> Result<()> {
         };
         let status = if path(name).exists() { policy::status_of(&key(name), &path(name)).text() } else { "no policy" };
         let (bytes, used) = if bundle.exists() { store::usage(&bundle) } else { (0, None) };
-        let used = used
-            .and_then(|t| Timestamp::try_from(t).ok())
-            .map_or("-".to_string(), |t| t.to_zoned(TimeZone::system()).strftime("%Y-%m-%d %H:%M").to_string());
+        let used = used.and_then(|t| Timestamp::try_from(t).ok()).map_or("-".to_string(), |t| t.to_zoned(TimeZone::system()).strftime("%Y-%m-%d %H:%M").to_string());
         let sites = parsed.as_ref().map_or(String::new(), |p| p.sites.join(", "));
         let about = parsed.as_ref().map_or("", |p| p.about.as_str());
         let size = if bundle.exists() { human(bytes) } else { "-".into() };
@@ -865,7 +859,14 @@ mod tests {
 
     #[test]
     fn keeps_cred_s_own_folders_out_of_boxes() {
-        for path in [home(), config_dir(), config_dir().join("policy"), home().join(".config"), home().join("Library/Application Support/cred/box/open/x"), home().join("Library/Application Support")] {
+        for path in [
+            home(),
+            config_dir(),
+            config_dir().join("policy"),
+            home().join(".config"),
+            home().join("Library/Application Support/cred/box/open/x"),
+            home().join("Library/Application Support"),
+        ] {
             let text = format!("[[mount]]\npath = \"{}\"", path.display());
             let e = err(&text);
             assert!(e.contains("too broad") || e.contains("cred's own"), "{text}: {e}");
@@ -903,7 +904,10 @@ mod tests {
 
     #[test]
     fn sizes_read_plainly() {
-        assert_eq!((human(0), human(999), human(1500), human(25_000_000), human(3_200_000_000)), ("0 B".into(), "999 B".into(), "1.5 KB".into(), "25.0 MB".into(), "3.2 GB".into()));
+        assert_eq!(
+            (human(0), human(999), human(1500), human(25_000_000), human(3_200_000_000)),
+            ("0 B".into(), "999 B".into(), "1.5 KB".into(), "25.0 MB".into(), "3.2 GB".into())
+        );
     }
 
     #[test]

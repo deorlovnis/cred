@@ -130,11 +130,7 @@ fn plan(sh: &Shared, head: &Head, method: &str, target: &str) -> Result<Plan, De
     }
     let approved = policy::load(model).map_err(|e| denied(403, "blocked:policy", format!("{e:#}")))?;
     crate::refresh::refresh_due(std::slice::from_ref(model), false, false);
-    let fetch = approved
-        .policy
-        .fetch
-        .as_ref()
-        .ok_or_else(|| denied(403, "blocked:policy", format!("the policy for {model} has no [fetch] section")))?;
+    let fetch = approved.policy.fetch.as_ref().ok_or_else(|| denied(403, "blocked:policy", format!("the policy for {model} has no [fetch] section")))?;
     let method = method.to_ascii_uppercase();
     if !METHODS.contains(&method.as_str()) {
         return Err(denied(405, "blocked:method", format!("method must be one of {}", METHODS.join(", "))));
@@ -158,11 +154,7 @@ fn plan(sh: &Shared, head: &Head, method: &str, target: &str) -> Result<Plan, De
         }
         None => None,
     };
-    Ok(Plan {
-        url: format!("{}/{rest}", host.trim_end_matches('/')),
-        headers: rewrite_headers(&head.headers, &fetch.auth_header, &fetch.headers, auth.as_deref()),
-        secrets,
-    })
+    Ok(Plan { url: format!("{}/{rest}", host.trim_end_matches('/')), headers: rewrite_headers(&head.headers, &fetch.auth_header, &fetch.headers, auth.as_deref()), secrets })
 }
 
 /// Whether the box sent the stand-in as its key: `x-api-key: cred-managed`, or
@@ -180,11 +172,7 @@ fn has_standin(head: &Head) -> bool {
 /// policy's fixed headers (replacing any of the same name), the real auth header, and a request
 /// for uncompressed answers (the gateway doesn't recompress what it streams).
 fn rewrite_headers(incoming: &[(String, String)], auth_header: &str, fixed: &BTreeMap<String, String>, auth: Option<&str>) -> Vec<(String, String)> {
-    let named: Vec<String> = incoming
-        .iter()
-        .filter(|(n, _)| n.eq_ignore_ascii_case("connection"))
-        .flat_map(|(_, v)| v.split(',').map(|t| t.trim().to_ascii_lowercase()))
-        .collect();
+    let named: Vec<String> = incoming.iter().filter(|(n, _)| n.eq_ignore_ascii_case("connection")).flat_map(|(_, v)| v.split(',').map(|t| t.trim().to_ascii_lowercase())).collect();
     let mut out: Vec<(String, String)> = incoming
         .iter()
         .filter(|(name, _)| {

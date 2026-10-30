@@ -11,8 +11,8 @@ use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Command;
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -323,7 +323,8 @@ fn shared(dir: &Path, name: &str, writes: Mode, allow_writes: &[&str]) -> Arc<Sh
         sites: vec!["app".into(), "readonly".into(), "askme".into(), "pending".into()],
         net: Net { writes, allow_writes: allow_writes.iter().map(|p| p.to_string()).collect() },
         log: dir.join(format!("{name}.log")),
-        log_key: LOG_KEY, browser: None,
+        log_key: LOG_KEY,
+        browser: None,
         ca: None,
         browser_socket: None,
         browser_tokens: Default::default(),
@@ -479,7 +480,11 @@ fn site_hosts(sh: &Arc<Shared>, yes: bool) {
     let mut rig = Rig::new(sh, host);
 
     // The credential is the site's whatever the guest sent, once, and the answer is masked.
-    let (reply, body) = rig.guest.get(host, "/echo?api_key=hunter2", &[("Authorization", "Bearer guests-own"), ("authorization", "Basic Zm9v"), ("X-Client", "mine"), ("Accept-Encoding", "gzip, br")]);
+    let (reply, body) = rig.guest.get(
+        host,
+        "/echo?api_key=hunter2",
+        &[("Authorization", "Bearer guests-own"), ("authorization", "Basic Zm9v"), ("X-Client", "mine"), ("Accept-Encoding", "gzip, br")],
+    );
     assert_eq!(reply.status, 200);
     assert_eq!(body, format!("token is {MASK} ok"));
     assert_eq!(reply.head.header("content-length"), None, "masking changes the length");
@@ -487,7 +492,10 @@ fn site_hosts(sh: &Arc<Shared>, yes: bool) {
     assert_eq!(reply.head.header("etag"), Some("\"x\""), "other headers pass");
     let seen = rig.reached()[0].clone();
     assert_eq!(seen.count("authorization"), 1);
-    assert_eq!((seen.header("authorization"), seen.header("x-client"), seen.header("accept-encoding")), (Some(format!("Bearer {SECRET}").as_str()), Some("cred"), Some("identity")));
+    assert_eq!(
+        (seen.header("authorization"), seen.header("x-client"), seen.header("accept-encoding")),
+        (Some(format!("Bearer {SECRET}").as_str()), Some("cred"), Some("identity"))
+    );
     assert_eq!(seen.count("x-client"), 1);
 
     // A value cut across two chunks is still found.

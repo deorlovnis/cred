@@ -11,9 +11,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -93,10 +93,15 @@ fn files_site(signer: &BoxCa) -> SocketAddr {
                         "/" => {
                             let n = visits.fetch_add(1, Ordering::SeqCst) + 1;
                             let cookie = head.header("cookie").unwrap_or("none");
-                            let page = format!("<html><head><title>Files</title></head><body><h1>Files</h1><p>cookie: {cookie}</p><a href=\"/file\">Get the file</a></body></html>");
+                            let page =
+                                format!("<html><head><title>Files</title></head><body><h1>Files</h1><p>cookie: {cookie}</p><a href=\"/file\">Get the file</a></body></html>");
                             ("200 OK", format!("content-type: text/html\r\nset-cookie: sid=visit{n}; Path=/; Secure; HttpOnly\r\n"), page)
                         }
-                        "/file" => ("200 OK", "content-type: application/octet-stream\r\ncontent-disposition: attachment; filename=\"../evil name.txt\"\r\n".to_string(), "downloaded content\n".to_string()),
+                        "/file" => (
+                            "200 OK",
+                            "content-type: application/octet-stream\r\ncontent-disposition: attachment; filename=\"../evil name.txt\"\r\n".to_string(),
+                            "downloaded content\n".to_string(),
+                        ),
                         _ => ("404 Not Found", "content-type: text/plain\r\n".to_string(), "no".to_string()),
                     };
                     let out = reader.get_mut();
@@ -271,7 +276,10 @@ fn scenario() {
     assert!(example.call(json!({ "cmd": "snapshot" })).unwrap().contains("Example Domain"));
     let lines = log_lines(&log);
     assert!(lines.iter().any(|l| l["site"] == "example" && l["host"] == "example.com" && l["decision"] == "allowed"), "{lines:?}");
-    assert!(lines.iter().any(|l| l["site"] == "example" && l["kind"] == "request" && l["url"] == "https://example.com/" && l["status"] == 200), "TLS was ended at the door and the page read: {lines:?}");
+    assert!(
+        lines.iter().any(|l| l["site"] == "example" && l["kind"] == "request" && l["url"] == "https://example.com/" && l["status"] == 200),
+        "TLS was ended at the door and the page read: {lines:?}"
+    );
 
     // The trust is real: a Chromium that doesn't have the CA in its NSS database (another HOME)
     // refuses the door's certificate, and the door sees the handshake fail.
@@ -437,7 +445,10 @@ fn rotating_site(signer: &BoxCa) -> (SocketAddr, Arc<std::sync::Mutex<Vec<String
                     let (headers, body) = if target == "/" {
                         let mut seen = seen.lock().unwrap();
                         seen.push(head.header("cookie").unwrap_or("none").to_string());
-                        (format!("content-type: text/html\r\nset-cookie: sid=visit{}; Path=/; Secure; HttpOnly\r\n", seen.len()), "<html><head><title>Rotating</title></head><body><h1>Rotating</h1></body></html>")
+                        (
+                            format!("content-type: text/html\r\nset-cookie: sid=visit{}; Path=/; Secure; HttpOnly\r\n", seen.len()),
+                            "<html><head><title>Rotating</title></head><body><h1>Rotating</h1></body></html>",
+                        )
                     } else {
                         ("content-type: text/plain\r\n".to_string(), "no")
                     };
