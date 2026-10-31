@@ -200,6 +200,8 @@ pub fn connect(client: &Arc<ClientConfig>, host: &str, tcp: TcpStream) -> Result
 struct Inner {
     conn: Mutex<Connection>,
     raw_in: Mutex<Box<dyn Read + Send>>,
+    /// Bytes read from `raw_in` that the session couldn't take yet (see `read`).
+    held: Mutex<Vec<u8>>,
     pending: Mutex<Vec<u8>>,
     raw_out: Mutex<Box<dyn Write + Send>>,
 }
@@ -243,7 +245,7 @@ impl Tls {
             conn.write_tls(&mut raw_out)?;
         }
         raw_out.flush()?;
-        Ok(Tls(Arc::new(Inner { conn: Mutex::new(conn), raw_in: Mutex::new(raw_in), pending: Mutex::new(Vec::new()), raw_out: Mutex::new(raw_out) })))
+        Ok(Tls(Arc::new(Inner { conn: Mutex::new(conn), raw_in: Mutex::new(raw_in), held: Mutex::new(Vec::new()), pending: Mutex::new(Vec::new()), raw_out: Mutex::new(raw_out) })))
     }
 
     /// What was agreed with the peer, e.g. `http/1.1`.
@@ -298,26 +300,42 @@ impl Read for Tls {
                     done => return done,
                 }
             }
-            let n = match locked(&self.0.raw_in).read(&mut raw) {
-                Ok(n) => n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
+            // Bytes held back last time go in before more is read from the socket.
+            let held = std::mem::take(&mut *locked(&self.0.held));
+            let mut chunk: &[u8] = if held.is_empty() {
+                let n = match locked(&self.0.raw_in).read(&mut raw) {
+                    Ok(n) => n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                };
+                if n == 0 {
+                    // The end of the stream: the next read says whether it was a clean close.
+                    locked(&self.0.conn).read_tls(&mut io::empty())?;
+                    continue;
+                }
+                &raw[..n]
+            } else {
+                &held
             };
             let mut conn = locked(&self.0.conn);
-            if n == 0 {
-                // The end of the stream: the next read says whether it was a clean close.
-                conn.read_tls(&mut io::empty())?;
-                continue;
-            }
-            let mut chunk = &raw[..n];
+            // rustls keeps at most 16 KiB of plaintext and refuses more input until it is read,
+            // and one full record is that much. So input stops once there is plaintext, and the
+            // rest is held for the next call, after the caller has read it.
             while !chunk.is_empty() {
                 conn.read_tls(&mut chunk)?;
-                if let Err(e) = conn.process_new_packets() {
-                    let _ = self.queue(&mut conn);
-                    drop(conn);
-                    let _ = self.send();
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+                match conn.process_new_packets() {
+                    Ok(state) if state.plaintext_bytes_to_read() > 0 => break,
+                    Ok(_) => {}
+                    Err(e) => {
+                        let _ = self.queue(&mut conn);
+                        drop(conn);
+                        let _ = self.send();
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+                    }
                 }
+            }
+            if !chunk.is_empty() {
+                *locked(&self.0.held) = chunk.to_vec();
             }
             // Answers to what was read (key updates, alerts) go out now. Nothing waits for a
             // write that has nothing to do with it.

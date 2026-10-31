@@ -40,6 +40,20 @@ elif ! container system status >/dev/null 2>&1; then
   echo "note: container's system isn't running; run 'container system start', then install.sh again to build the agent image" >&2
 elif container build -f box/agent.Containerfile -t cred-agent box; then
   echo "built the agent image cred-agent"
+  # The JVM variant (a JDK and the Kotlin language server), from exactly that build. The builder
+  # looks a digest up on Docker Hub, so it gets the cred-agent:<hex> tag cred itself runs images by.
+  digest=$(container image inspect cred-agent | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s)[0].configuration.descriptor.digest))')
+  container image tag cred-agent "cred-agent:${digest#sha256:}"
+  if container build -f box/agent-jvm.Containerfile -t cred-agent-jvm --build-arg "AGENT=cred-agent:${digest#sha256:}" box; then
+    echo "built the JVM agent image cred-agent-jvm"
+  else
+    echo "warning: building the JVM agent image failed; boxes pinned to cred-agent-jvm won't run until it builds" >&2
+  fi
+  if container build -f box/agent-rust.Containerfile -t cred-agent-rust --build-arg "AGENT=cred-agent:${digest#sha256:}" box; then
+    echo "built the Rust agent image cred-agent-rust"
+  else
+    echo "warning: building the Rust agent image failed; boxes pinned to cred-agent-rust won't run until it builds" >&2
+  fi
 else
   echo "warning: building the agent image failed; boxes won't run until 'container build' of box/agent.Containerfile works" >&2
 fi

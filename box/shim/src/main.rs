@@ -5,7 +5,8 @@
 //! instead, and each of their connections is paired with one of those idle connections from the
 //! Mac. The first line sent to the Mac says which listener the program came to:
 //!
-//! - `proxy`: TCP 127.0.0.1:3128, the HTTP proxy
+//! - `proxy`: TCP 127.0.0.1:3128, the HTTP proxy (`serve --bridges`: port 3128 on every address,
+//!   so Docker's containers reach it at their bridge's gateway)
 //! - `cred`:  TCP 127.0.0.2:80, `cred.internal`
 //! - `mcp`:   /run/cred/local.sock, which `cred-shim mcp` (cred's MCP server over stdio) dials
 //!
@@ -24,16 +25,23 @@ const RUN_DIR: &str = "/run/cred";
 const DOOR_SOCK: &str = "/run/cred/door.sock";
 const LOCAL_SOCK: &str = "/run/cred/local.sock";
 const PROXY_ADDR: (&str, u16) = ("127.0.0.1", 3128);
+/// The proxy for a box with Docker: a container has a network namespace of its own, where
+/// 127.0.0.1 is the container itself, so it can only reach the proxy at an address of the VM on
+/// its bridge. The VM has no network device, so every address is still inside it.
+const PROXY_ALL: (&str, u16) = ("0.0.0.0", 3128);
 const CRED_ADDR: (&str, u16) = ("127.0.0.2", 80);
 
 fn main() {
-    let result = match env::args().nth(1).as_deref() {
-        Some("serve") => serve(),
-        Some("mcp") => UnixStream::connect(LOCAL_SOCK)
+    let args: Vec<String> = env::args().skip(1).collect();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let result = match args[..] {
+        ["serve"] => serve(PROXY_ADDR),
+        ["serve", "--bridges"] => serve(PROXY_ALL),
+        ["mcp"] => UnixStream::connect(LOCAL_SOCK)
             .map_err(|e| io::Error::new(e.kind(), format!("connecting to {LOCAL_SOCK}: {e}")))
             .and_then(|sock| relay(sock, io::stdin(), io::stdout())),
         _ => {
-            eprintln!("usage: cred-shim serve | mcp");
+            eprintln!("usage: cred-shim serve [--bridges] | mcp");
             process::exit(2);
         }
     };
@@ -174,14 +182,14 @@ fn bind_tcp(addr: (&str, u16)) -> io::Result<TcpListener> {
 
 /// The init process of the VM: the listeners, and the pool the Mac fills. Returns only on a
 /// startup error; client trouble never ends it.
-fn serve() -> io::Result<()> {
+fn serve(proxy: (&str, u16)) -> io::Result<()> {
     fs::create_dir_all(RUN_DIR)?;
     fs::set_permissions(RUN_DIR, fs::Permissions::from_mode(0o755))?;
     let pool = Arc::new(Pool::default());
     // Only root may connect to the door socket: a program in the box must not pose as the Mac.
     let door = bind_unix(DOOR_SOCK, 0o600)?;
     let local = bind_unix(LOCAL_SOCK, 0o666)?;
-    let proxy = bind_tcp(PROXY_ADDR)?;
+    let proxy = bind_tcp(proxy)?;
     let cred = bind_tcp(CRED_ADDR)?;
 
     let p = pool.clone();

@@ -513,6 +513,7 @@ impl Env {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
 fn box_new_makes_a_policy_a_key_and_an_encrypted_store() {
     let env = Env::new();
     let out = env.boxed("true", &["new", "research"]);
@@ -536,6 +537,7 @@ fn box_new_makes_a_policy_a_key_and_an_encrypted_store() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
 fn box_policies_are_approved_edited_and_blocked_like_resource_policies() {
     let env = Env::new();
     env.new_box("research");
@@ -623,6 +625,7 @@ fn box_login(env: &Env, args: &[&str], enter_at: Option<&str>) -> (Output, Strin
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
 fn box_login_signs_in_site_by_site_and_seals_each_session_in_the_box() {
     let env = Env::new();
     let origin = "http://127.0.0.1:9";
@@ -717,6 +720,7 @@ fn a_box_that_is_not_kept_has_no_key_and_no_store() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
 fn box_import_export_and_log_go_through_touch_id_and_stay_in_the_box() {
     let env = Env::new();
     env.new_box("research");
@@ -787,6 +791,7 @@ impl Env {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
 fn box_log_verify_finds_a_changed_line_and_a_missing_one() {
     let env = Env::new();
     env.new_box("research");
@@ -822,6 +827,7 @@ fn box_log_verify_finds_a_changed_line_and_a_missing_one() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
 fn box_rm_deletes_the_key_then_the_store_and_warns_about_backups() {
     let env = Env::new();
     env.new_box("research");

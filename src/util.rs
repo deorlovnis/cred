@@ -62,6 +62,9 @@ fn set_blocking(fd: i32) {
     // The values of <fcntl.h> on macOS.
     const F_GETFL: i32 = 3;
     const F_SETFL: i32 = 4;
+    #[cfg(target_os = "linux")]
+    const O_NONBLOCK: i32 = 0o4000;
+    #[cfg(not(target_os = "linux"))]
     const O_NONBLOCK: i32 = 0x0004;
     unsafe {
         let flags = fcntl(fd, F_GETFL);

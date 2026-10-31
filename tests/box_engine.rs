@@ -156,9 +156,16 @@ fn vm_has_only_the_door() {
     }
     engine::available().unwrap();
 
-    let image = engine::build_agent_image(&Path::new(env!("CARGO_MANIFEST_DIR")).join("box")).unwrap();
-    assert!(image.starts_with("cred-agent@sha256:"), "{image}");
-    assert_eq!(engine::image_digest(engine::AGENT_IMAGE).unwrap(), image);
+    // CRED_E2E_AGENT_IMAGE: an image built already, under another name, so `cred-agent` stays as it is.
+    let image = match env::var("CRED_E2E_AGENT_IMAGE") {
+        Ok(name) => engine::image_digest(&name).unwrap(),
+        Err(_) => {
+            let image = engine::build_agent_image(&Path::new(env!("CARGO_MANIFEST_DIR")).join("box")).unwrap();
+            assert!(image.starts_with("cred-agent@sha256:"), "{image}");
+            assert_eq!(engine::image_digest(engine::AGENT_IMAGE).unwrap(), image);
+            image
+        }
+    };
 
     // a short path for the socket (macOS limits them), and folders to mount
     let dir = PathBuf::from(format!("/tmp/cred-e2e-box-{}", process::id()));
@@ -178,6 +185,7 @@ fn vm_has_only_the_door() {
         socket: dir.join("door.sock"),
         mounts: vec![engine::Mount { host: home.clone(), guest: "/home/agent".into(), readonly: false }, engine::Mount { host: ro, guest: "/ro".into(), readonly: true }],
         docker: false,
+        rosetta: false,
     };
     let door = TestDoor::start(&spec.socket);
     let vm = Vm(name.clone());

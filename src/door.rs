@@ -402,6 +402,8 @@ impl Log {
 }
 
 #[cfg(test)]
+mod docker_vm_tests;
+#[cfg(test)]
 mod inspect_tests;
 #[cfg(test)]
 mod intercept_tests;

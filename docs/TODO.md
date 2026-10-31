@@ -20,6 +20,39 @@ keep files) but can't get out. Design: `docs/box-design.md` (local notes, not pu
   install is next. Then phase 4 (hardening).
 - Done when: phases 1–3 of the design pass their "Done when" tests.
 
+### Docker in a box (built, 2026-10-30)
+
+`docker = true` works: see "Development tools" in the design. Tested on real VMs behind the real
+door (`src/door/docker_vm_tests.rs`): `docker run hello-world` as the agent, Testcontainers 2.0.5
+with Postgres, Kafka and Ryuk from Gradle, containers kept to the door, and a box without
+`docker = true` has no dockerd and no extra capabilities.
+
+Left:
+- Pulled images aren't kept, and they count against the box's memory. Consider an ext4 image in
+  the store if pulling every run hurts.
+- `docker build` steps that fetch: containers don't trust the box CA, and plain http is refused.
+
+### Dev tools still missing from the images (found 2026-10-30, a full run on a real project)
+
+- No compiler in `cred-agent` or `cred-agent-jvm` (`cred-agent-rust` has one): `build-essential`
+  and `cmake`. A Python project with `z3-solver` needs them, because
+  its arm64 Linux wheel wants glibc 2.38 and Bookworm has 2.36, so uv builds it from
+  source. Moving the image to Debian 13 (trixie) would be the other way.
+- No `ps` or `pkill` in those two either: `procps`.
+- `LANG` is unset, so the JVM reads file names as ASCII and Gradle fails on a test whose name has
+  a `—`. Setting `C.UTF-8` in the box's home (`~/.claude/settings.json`, `~/.bashrc`) works;
+  it belongs in `engine::agent_env`, for every box.
+- uv picks the newest Python for `>=3.12`, 3.15, which jaxlib and others don't support.
+  `uv python pin --global 3.12` in the box works around it.
+- Containers don't trust the box CA, so `docker build` steps that download fail.
+- An image change means a new digest, so a repin and an approval; do these together.
+
+### Opening a box without starting Claude (asked for 2026-10-30)
+
+`cred box run NAME` goes straight into Claude Code, because new boxes get `run = ["claude"]`. That isn't always wanted. Today `cred box run NAME -- bash` gives a shell, and
+`run = ["bash"]` in the policy makes that the default. Decide whether a shell should be the default
+for new boxes, or whether `run` should ask.
+
 ## 2. Boxes and the Mac: code in, work out, recovery, the IDE
 
 Technical task, open for discussion: the options below are a starting point, not a decision;
@@ -91,6 +124,10 @@ key would need one Keychain prompt after every update.
 - Alternative: sign with an Apple Developer ID (Team ID). That would also allow the data
   protection keychain with access control, i.e. Touch ID on the items themselves.
 - Done when: install a new build, and approved policies still read as approved, with no prompt.
+- Side effect in the door (found 2026-10-30, fixed): it connects to a site at `CONNECT` and reads
+  the site's fields per request, after that, so the first request after an install waited for
+  the Keychain prompt until GitHub dropped the connection (`502`, `failed:upstream`). A box now
+  reads its sites' fields while it opens (`site_ready`), so the prompts come then.
 
 ## 4. Audit log and idle timeouts in boxes
 

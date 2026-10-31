@@ -9,21 +9,16 @@ aes = "0.9"
 aho-corasick = "1.1"
 anyhow = "1.0"
 base64 = "0.22"
-block2 = "0.6"
 cbc = { version = "0.2", features = ["alloc"] }
 chacha20poly1305 = "0.11.0"
 clap = { version = "4.6", features = ["derive"] }
 jiff = { version = "0.2", features = ["serde"] }
-objc2 = "0.6"
-objc2-foundation = "0.3"
-objc2-local-authentication = "0.3"
 pbkdf2 = "0.13"
 percent-encoding = "2.3"
 rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
 rpassword = "7.5"
 rusqlite = { version = "0.41", features = ["bundled"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
-security-framework = "3.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha1 = "0.11"
@@ -35,6 +30,15 @@ toml = "1.1"
 ureq = "3.5"
 url = "2.5"
 webpki-roots = "1"
+
+# Touch ID and the Keychain. Elsewhere (a box's Linux) cred builds and its tests run, but there's
+# nothing to keep secrets in: see `keychain::backend` and `approve`.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-local-authentication = "0.3"
+security-framework = "3.7"
 
 [profile.release]
 lto = true
