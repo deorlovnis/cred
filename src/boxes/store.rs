@@ -482,6 +482,7 @@ mod tests {
 
     /// The real thing: hdiutil, in a temp folder, with a random key.
     #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
     fn stores_are_encrypted_and_open_only_with_the_key() {
         let dir = TempDir::new("cred-store").unwrap();
         let layout = Layout::under(&dir.0).unwrap();

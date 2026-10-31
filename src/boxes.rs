@@ -111,9 +111,15 @@ pub struct BoxPolicy {
     pub cpus: u32,
     #[serde(default = "default_memory")]
     pub memory: String,
-    /// Docker Engine inside the VM, with the extra capabilities it needs.
+    /// Docker Engine inside the VM, with the extra capabilities it needs; the agent can use it,
+    /// which makes it root in the VM (see `engine::start_docker`). Pulls and containers' traffic
+    /// still go through the door, under `[net]`.
     #[serde(default)]
     pub docker: bool,
+    /// Rosetta in the VM, for x86-64 programs and images on an Apple silicon Mac: a project's
+    /// container that has no arm64 build runs under it. Off unless a box asks.
+    #[serde(default)]
+    pub rosetta: bool,
     #[serde(default)]
     pub net: Net,
     #[serde(default)]
@@ -255,9 +261,6 @@ impl BoxPolicy {
                 bail!("standins lists {name} twice");
             }
         }
-        if self.docker {
-            bail!("docker = true isn't available yet: the agent image has no Docker Engine");
-        }
         if !(1..=64).contains(&self.cpus) {
             bail!("cpus must be between 1 and 64");
         }
@@ -317,6 +320,8 @@ model = "anthropic"                     # resource whose key cred adds to the ag
 sites = []                              # resources the agent may use through cred; their policies apply
 # standins = ["GH_TOKEN"]               # variables set to "cred-managed" for tools that insist on a token; cred adds the real credential on the hosts of `sites`
 keep = true                            # false: the box is shredded when it stops
+# docker = true                         # Docker Engine in the VM; it makes the agent root in the VM, which stays the boundary
+# rosetta = true                        # Rosetta in the VM, for x86-64 images with no arm64 build
 cpus = 4
 memory = "8G"
 
@@ -782,6 +787,8 @@ mod tests {
         ))
         .unwrap();
         assert_eq!((p.keep, p.cpus, p.memory.as_str(), p.docker), (false, 2, "512M", false));
+        assert!(BoxPolicy::parse("docker = true").unwrap().docker);
+        assert!(!p.rosetta && BoxPolicy::parse("rosetta = true").unwrap().rosetta);
         assert_eq!(p.allow(), ["*", "https://*.wikipedia.org", "https://docs.rs", "https://example.com"]);
         assert_eq!((p.net.writes, p.net.allow_writes.len(), p.standins.as_slice()), (Mode::Ask, 2, &["GH_TOKEN".to_string(), "NPM_TOKEN".to_string()][..]));
         assert_eq!(BoxPolicy::parse("[net]\nwrites = \"allow\"").unwrap().net.writes, Mode::Allow);
@@ -800,7 +807,6 @@ mod tests {
     #[test]
     fn rejects_what_the_door_cannot_keep() {
         for (text, why) in [
-            ("docker = true", "docker = true isn't available"),
             ("[browser]\nkeep_session = true", "unknown field"),
             ("[browser]\ndownloads = \"yes\"", "invalid type"),
             ("[[mount]]\npath = \"/opt/data\"\nmode = \"rw\"", "rw isn't available"),

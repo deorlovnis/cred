@@ -2,17 +2,9 @@
 //! An agent can't answer this prompt, so it gates everything that loosens a policy or
 //! releases a value outside cred.
 
-use std::sync::{Mutex, mpsc};
-use std::time::Duration;
+use std::sync::Mutex;
 
 use anyhow::{Result, bail};
-use block2::RcBlock;
-use objc2::runtime::Bool;
-use objc2_foundation::{NSError, NSString};
-use objc2_local_authentication::{LAContext, LAPolicy};
-
-/// How long the prompt waits for an answer before it is withdrawn.
-const TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How each prompt was answered since the last `take_answers` (true: approved).
 static ANSWERS: Mutex<Vec<bool>> = Mutex::new(Vec::new());
@@ -37,6 +29,22 @@ fn prompt(reason: &str) -> Result<()> {
         return if answer == "yes" { Ok(()) } else { bail!("not approved: {reason}") };
     }
 
+    ask_person(reason)
+}
+
+#[cfg(target_os = "macos")]
+fn ask_person(reason: &str) -> Result<()> {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use block2::RcBlock;
+    use objc2::runtime::Bool;
+    use objc2_foundation::{NSError, NSString};
+    use objc2_local_authentication::{LAContext, LAPolicy};
+
+    /// How long the prompt waits for an answer before it is withdrawn.
+    const TIMEOUT: Duration = Duration::from_secs(120);
+
     let context = unsafe { LAContext::new() };
     let (tx, rx) = mpsc::channel();
     let reply = RcBlock::new(move |ok: Bool, error: *mut NSError| {
@@ -54,4 +62,10 @@ fn prompt(reason: &str) -> Result<()> {
             bail!("no answer to the approval prompt: {reason}")
         }
     }
+}
+
+/// Nobody can answer here, so everything that needs a person is refused.
+#[cfg(not(target_os = "macos"))]
+fn ask_person(reason: &str) -> Result<()> {
+    bail!("not approved (Touch ID needs macOS): {reason}")
 }

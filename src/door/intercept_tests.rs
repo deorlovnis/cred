@@ -273,7 +273,7 @@ fn the_door_ends_tls_for_a_guest_that_trusts_only_the_box_ca() {
 // --- a real VM ---
 
 /// Run a script in the VM as the agent: (succeeded, stdout and stderr).
-fn sh(vm: &str, env: &[(String, String)], script: &str) -> (bool, String) {
+pub(super) fn sh(vm: &str, env: &[(String, String)], script: &str) -> (bool, String) {
     let cmd = ["sh".to_string(), "-c".to_string(), script.to_string()];
     let out = crate::engine::exec_command(vm, env, &cmd, false).stdin(std::process::Stdio::null()).output().unwrap();
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
@@ -281,7 +281,7 @@ fn sh(vm: &str, env: &[(String, String)], script: &str) -> (bool, String) {
 }
 
 /// The VM stops when the test ends, however it ends.
-struct Vm(String);
+pub(super) struct Vm(pub(super) String);
 
 impl Drop for Vm {
     fn drop(&mut self) {
@@ -316,6 +316,7 @@ fn real_vm_tools_trust_the_door_and_only_the_door() {
         socket: dir.join("door.sock"),
         mounts: vec![],
         docker: false,
+        rosetta: false,
     };
     let ca = Arc::new(BoxCa::generate("e2e").unwrap());
     let log = dir.join("log").join("door.log");

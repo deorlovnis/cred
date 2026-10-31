@@ -55,8 +55,9 @@ const SOCKET_PATH_MAX: usize = 103;
 /// `oauth` says how the model resource authenticates: a subscription token
 /// (`Authorization`) or an API key (`x-api-key`).
 pub fn agent_env(oauth: bool) -> Vec<(String, String)> {
-    let proxy = "http://127.0.0.1:3128";
+    let proxy = PROXY;
     let key = if oauth { "CLAUDE_CODE_OAUTH_TOKEN" } else { "ANTHROPIC_API_KEY" };
+    let java = java_options();
     [
         ("HTTPS_PROXY", proxy),
         ("https_proxy", proxy),
@@ -67,6 +68,8 @@ pub fn agent_env(oauth: bool) -> Vec<(String, String)> {
         // Node's built-in fetch ignores the proxy variables without this (it warns that it's
         // experimental once per process).
         ("NODE_USE_ENV_PROXY", "1"),
+        // The JVM ignores the proxy variables too (Gradle, the Kotlin daemon, a language server).
+        ("JAVA_TOOL_OPTIONS", java.as_str()),
         ("ANTHROPIC_BASE_URL", "http://127.0.0.2/model"),
         (key, STANDIN),
         ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
@@ -87,6 +90,14 @@ pub fn agent_env(oauth: bool) -> Vec<(String, String)> {
 }
 
 const NO_PROXY: &str = "127.0.0.2,cred.internal,localhost,127.0.0.1";
+const PROXY: &str = "http://127.0.0.1:3128";
+
+/// The door's proxy as JVM system properties, with NO_PROXY's names left out. Java's truststore
+/// comes from the image (agent-jvm.Containerfile makes it from the bundle with the box CA).
+fn java_options() -> String {
+    let direct = NO_PROXY.replace(',', "|");
+    ["https", "http"].map(|s| format!("-D{s}.proxyHost=127.0.0.1 -D{s}.proxyPort=3128")).join(" ") + &format!(" -Dhttp.nonProxyHosts={direct}")
+}
 
 /// A folder of the Mac mounted into the VM.
 pub struct Mount {
@@ -106,8 +117,11 @@ pub struct VmSpec {
     /// Where the door's socket appears on the Mac. Must be short: macOS limits socket paths.
     pub socket: PathBuf,
     pub mounts: Vec<Mount>,
-    /// Docker Engine inside the VM. Not supported yet: the agent image doesn't contain it.
+    /// Docker Engine inside the VM: the capabilities dockerd needs, and its data in memory.
+    /// `start_docker` then starts it.
     pub docker: bool,
+    /// Rosetta in the VM, for x86-64 programs and containers.
+    pub rosetta: bool,
 }
 
 fn container() -> Command {
@@ -144,8 +158,24 @@ pub fn available() -> Result<()> {
 /// container, where it sees the root filesystem but not the container's tmpfs mounts, so
 /// /run/cred/door.sock has to be on a writable root. The image takes away what the agent could
 /// write there instead (see box/agent.Containerfile).
+///
+/// With Docker, root in the VM gets what dockerd needs (CAP_SYS_ADMIN for mounts and cgroups,
+/// CAP_NET_ADMIN for its bridges, CAP_SYS_PTRACE for `docker exec` into a container that doesn't
+/// run as root, a writable /proc/sys), and /var/lib/docker is in memory like
+/// /tmp: images, containers and their volumes are the box's working data, which must not land in
+/// `container`'s own files, and they go when the VM stops. The shim's proxy then listens on every
+/// address, so containers reach it from their bridges; the VM still has no network device, so
+/// that adds no way out.
 fn run_args(spec: &VmSpec, image: &str) -> Result<Vec<String>> {
     let mut args: Vec<String> = ["run", "--progress", "none", "--detach", "--rm", "--init", "--network", "none", "--tmpfs", "/tmp", "--tmpfs", "/var/tmp"].map(String::from).into();
+    if spec.docker {
+        args.extend(
+            ["--tmpfs", DOCKER_DATA, "--cap-add", "CAP_SYS_ADMIN", "--cap-add", "CAP_NET_ADMIN", "--cap-add", "CAP_SYS_PTRACE", "--read-only-path", "NONE"].map(String::from),
+        );
+    }
+    if spec.rosetta {
+        args.push("--rosetta".into());
+    }
     args.extend(["--name".into(), spec.name.clone()]);
     args.extend(["--cpus".into(), spec.cpus.to_string(), "--memory".into(), spec.memory.clone()]);
     args.extend(["--publish-socket".into(), format!("{}:{DOOR_SOCKET}", spec.socket.display())]);
@@ -153,6 +183,9 @@ fn run_args(spec: &VmSpec, image: &str) -> Result<Vec<String>> {
         args.extend(["--mount".into(), mount_arg(m)?]);
     }
     args.extend(["--entrypoint".into(), "cred-shim".into(), image.into(), "serve".into()]);
+    if spec.docker {
+        args.push("--bridges".into());
+    }
     Ok(args)
 }
 
@@ -168,9 +201,6 @@ fn mount_arg(m: &Mount) -> Result<String> {
 
 /// Start the VM, detached. It is removed when it stops.
 pub fn run(spec: &VmSpec) -> Result<()> {
-    if spec.docker {
-        bail!("Docker inside a box isn't supported yet: the agent image has no Docker Engine");
-    }
     let socket = spec.socket.as_os_str().len();
     if socket > SOCKET_PATH_MAX {
         bail!("socket path {} is too long ({socket} bytes, macOS allows {SOCKET_PATH_MAX})", spec.socket.display());
@@ -229,6 +259,50 @@ pub fn install_ca(name: &str, pem: &str) -> Result<()> {
     Ok(())
 }
 
+/// Where dockerd keeps images and containers: memory (see `run_args`).
+const DOCKER_DATA: &str = "/var/lib/docker";
+/// The address of the VM on Docker's default bridge, fixed with `--bip` so the proxy address
+/// containers are given (`docker_proxies`) holds.
+const DOCKER_BRIDGE: &str = "172.17.0.1";
+
+/// Start Docker Engine in a VM made with `docker`, as root, and wait until it answers; after
+/// `install_ca`, since dockerd reads the system's CAs once. Its pulls go through the door's proxy
+/// like everything else. The agent uses its socket through the group `agent`: that makes the agent
+/// root in the VM, which holds no secret and no rule (the door, outside, keeps them), so the VM
+/// stays the boundary.
+///
+/// The cgroup steps are what Docker's own `dind` script does: with cgroup v2, a cgroup can hand
+/// controllers to children only while it has no processes of its own, so everything moves into a
+/// child first.
+pub fn start_docker(name: &str) -> Result<()> {
+    let script = format!(
+        "set -e; command -v dockerd >/dev/null || {{ echo 'the image has no Docker Engine: build it again with install.sh and pin the new digest' >&2; exit 1; }}; \
+         mkdir -p /sys/fs/cgroup/init; \
+         for p in $(cat /sys/fs/cgroup/cgroup.procs); do echo $p > /sys/fs/cgroup/init/cgroup.procs 2>/dev/null || :; done; \
+         sed -e 's/ / +/g' -e 's/^/+/' /sys/fs/cgroup/cgroup.controllers > /sys/fs/cgroup/cgroup.subtree_control; \
+         mount --make-rshared /; \
+         setsid dockerd --group {AGENT_USER} --bip {DOCKER_BRIDGE}/16 > {DOCKER_DATA}/dockerd.log 2>&1 < /dev/null & \
+         i=0; until docker version >/dev/null 2>&1; do \
+           i=$((i + 1)); [ $i -le 300 ] || {{ tail -n 20 {DOCKER_DATA}/dockerd.log >&2; exit 1; }}; sleep 0.1; \
+         done"
+    );
+    let mut cmd = container();
+    cmd.args(["exec", "--uid", "0", "--gid", "0"]);
+    for (key, value) in [("HTTPS_PROXY", PROXY), ("HTTP_PROXY", PROXY), ("NO_PROXY", NO_PROXY)] {
+        cmd.arg("-e").arg(format!("{key}={value}"));
+    }
+    capture(cmd.args([name, "sh", "-c", &script]), &format!("starting Docker in {name}"))?;
+    Ok(())
+}
+
+/// The Docker CLI's proxy settings (`proxies` in ~/.docker/config.json), which it hands to the
+/// containers it runs and builds: the door's proxy at the VM's address on the default bridge.
+/// Containers on other networks reach it too, through their gateway, which is the VM.
+pub fn docker_proxies() -> Value {
+    let proxy = format!("http://{DOCKER_BRIDGE}:3128");
+    serde_json::json!({ "default": { "httpProxy": proxy, "httpsProxy": proxy, "noProxy": "localhost,127.0.0.1" } })
+}
+
 pub fn browser_vm_name(box_id: &str) -> String {
     format!("cred-browser-{box_id}")
 }
@@ -255,7 +329,7 @@ pub fn run_browser(spec: &BrowserSpec) -> Result<()> {
         DirBuilder::new().recursive(true).mode(0o700).create(host).with_context(|| format!("creating {}", host.display()))?;
         mounts.push(Mount { host: host.clone(), guest: BROWSER_DOWNLOADS.into(), readonly: false });
     }
-    run(&VmSpec { name: spec.name.clone(), image: spec.image.clone(), cpus: 2, memory: "2G".into(), socket: spec.socket.clone(), mounts, docker: false })
+    run(&VmSpec { name: spec.name.clone(), image: spec.image.clone(), cpus: 2, memory: "2G".into(), socket: spec.socket.clone(), mounts, docker: false, rosetta: false })
 }
 
 /// Start a runner in the browser VM (`node /opt/runner/runner.mjs`, as the VM's user 1000),
@@ -422,6 +496,7 @@ mod tests {
                 Mount { host: "/Users/me/src".into(), guest: "/work/src".into(), readonly: true },
             ],
             docker: false,
+            rosetta: false,
         }
     }
 
@@ -441,6 +516,14 @@ mod tests {
         for var in ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "PIP_CERT", "GIT_SSL_CAINFO"] {
             assert_eq!(get(&key, var).as_deref(), Some("/etc/ssl/certs/ca-certificates.crt"), "{var}");
         }
+        // The JVM reads neither: it gets the proxy as properties, and goes direct where others do.
+        assert_eq!(
+            get(&key, "JAVA_TOOL_OPTIONS").as_deref(),
+            Some(
+                "-Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=3128 -Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort=3128 \
+                 -Dhttp.nonProxyHosts=127.0.0.2|cred.internal|localhost|127.0.0.1"
+            )
+        );
     }
 
     #[test]
@@ -513,10 +596,32 @@ mod tests {
     }
 
     #[test]
-    fn docker_boxes_and_long_sockets_are_refused_before_anything_runs() {
-        let mut s = spec();
-        s.docker = true;
-        assert!(run(&s).unwrap_err().to_string().contains("Docker"));
+    fn only_a_docker_box_gets_what_dockerd_needs() {
+        let plain = run_args(&spec(), "cred-agent:abc").unwrap().join(" ");
+        for extra in ["--cap-add", "--read-only-path", "/var/lib/docker", "--bridges"] {
+            assert!(!plain.contains(extra), "{extra} in {plain}");
+        }
+        let docker = run_args(&VmSpec { docker: true, ..spec() }, "cred-agent:abc").unwrap().join(" ");
+        assert_eq!(
+            docker,
+            "run --progress none --detach --rm --init --network none --tmpfs /tmp --tmpfs /var/tmp \
+             --tmpfs /var/lib/docker --cap-add CAP_SYS_ADMIN --cap-add CAP_NET_ADMIN --cap-add CAP_SYS_PTRACE --read-only-path NONE \
+             --name cred-box-research --cpus 4 --memory 8G \
+             --publish-socket /tmp/cred-501/research.sock:/run/cred/door.sock \
+             --mount type=bind,source=/Volumes/box/home,target=/home/agent \
+             --mount type=bind,source=/Users/me/src,target=/work/src,readonly \
+             --entrypoint cred-shim cred-agent:abc serve --bridges"
+        );
+        assert!(!docker.contains("--rosetta"));
+        assert!(run_args(&VmSpec { rosetta: true, ..spec() }, "cred-agent:abc").unwrap().contains(&"--rosetta".to_string()));
+        // Containers get the proxy at the VM's address on the bridge dockerd is started with.
+        let proxies = docker_proxies();
+        assert_eq!(proxies["default"]["httpsProxy"], format!("http://{DOCKER_BRIDGE}:3128"));
+        assert_eq!(proxies["default"]["httpProxy"], proxies["default"]["httpsProxy"]);
+    }
+
+    #[test]
+    fn long_sockets_are_refused_before_anything_runs() {
         let mut s = spec();
         s.socket = PathBuf::from(format!("/tmp/{}", "x".repeat(120)));
         assert!(run(&s).unwrap_err().to_string().contains("too long"));

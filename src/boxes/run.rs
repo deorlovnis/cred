@@ -29,6 +29,7 @@ use super::sessions::{InBox, Launch, Sessions};
 use super::store::{self, Layout};
 use super::{BoxPolicy, MountPolicy, mount_problem};
 use crate::chain::{self, Chain};
+use crate::index::Index;
 use crate::{approve, door, engine, keychain, policy, seal};
 
 /// Where the store's folders appear in the VM, and where `ro` folders go.
@@ -58,6 +59,8 @@ pub trait World: Sync {
     fn browser_image(&self) -> Result<String>;
     /// Make the box's CA trusted inside the VM (as root, before the agent starts).
     fn install_ca(&self, vm: &str, pem: &str) -> Result<()>;
+    /// Start Docker Engine in a VM started with `docker` (as root, after the CA, before the agent).
+    fn start_docker(&self, vm: &str) -> Result<()>;
     fn model_uses_bearer(&self, model: &str) -> Result<bool>;
     /// Fails unless the site has an approved policy.
     fn site_ready(&self, site: &str) -> Result<()>;
@@ -114,12 +117,20 @@ impl World for Real {
         engine::install_ca(vm, pem)
     }
 
+    fn start_docker(&self, vm: &str) -> Result<()> {
+        engine::start_docker(vm)
+    }
+
     fn model_uses_bearer(&self, model: &str) -> Result<bool> {
         door::model_uses_bearer(model)
     }
 
     fn site_ready(&self, site: &str) -> Result<()> {
-        policy::load(site).map(drop)
+        policy::load(site)?;
+        // A new cred build needs a Keychain prompt per item. It belongs here, while the box opens:
+        // in the door it would hold an open connection until the site dropped it.
+        let _ = Index::load().map(|index| index.values(site));
+        Ok(())
     }
 
     fn key(&self, name: &str) -> Result<String> {
@@ -234,7 +245,7 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
     let _ = store::log_event(&mnt, &log_key, "box", &req.id, 0, "started");
 
     // The folders are changed here, while no VM has them.
-    prepare_home(&mnt.join("home"))?;
+    prepare_home(&mnt.join("home"), policy.docker)?;
     let mut mounts = vec![
         engine::Mount { host: mnt.join("home"), guest: GUEST_HOME.into(), readonly: false },
         engine::Mount { host: mnt.join("work"), guest: GUEST_WORK.into(), readonly: false },
@@ -268,8 +279,16 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
         }
         None => (None, Box::new(|_| bail!("this box has no sites to browse"))),
     };
-    let spec =
-        engine::VmSpec { name: vm.clone(), image: image.to_string(), cpus: policy.cpus, memory: policy.memory.clone(), socket: socket.clone(), mounts, docker: policy.docker };
+    let spec = engine::VmSpec {
+        name: vm.clone(),
+        image: image.to_string(),
+        cpus: policy.cpus,
+        memory: policy.memory.clone(),
+        socket: socket.clone(),
+        mounts,
+        docker: policy.docker,
+        rosetta: policy.rosetta,
+    };
     let config = door::Config {
         name: req.id.clone(),
         socket: socket.clone(),
@@ -293,6 +312,9 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
     world.start_vm(&spec)?;
     door = world.start_door(config)?;
     world.install_ca(&vm, &ca.cert_pem())?;
+    if policy.docker {
+        world.start_docker(&vm)?;
+    }
 
     let done = AtomicBool::new(false);
     let status = thread::scope(|scope| {
@@ -445,7 +467,13 @@ fn clone_into(work: &Path, name: &str, host: &Path) -> Result<()> {
 /// What the agent needs in its home: Claude Code skips its web-fetch check (the door's rules take
 /// its place), knows cred's tools, and doesn't stop at first-run screens. Merged into what is
 /// there, so what the agent keeps in these files stays.
-fn prepare_home(home: &Path) -> Result<()> {
+fn prepare_home(home: &Path, docker: bool) -> Result<()> {
+    // The Docker CLI hands containers the door's proxy (they can't reach the agent's 127.0.0.1).
+    if docker {
+        merge_json(&home.join(".docker/config.json"), |o| {
+            o.insert("proxies".into(), engine::docker_proxies());
+        })?;
+    }
     merge_json(&home.join(".claude/settings.json"), |o| {
         o.insert("skipWebFetchPreflight".into(), json!(true));
     })?;
@@ -641,6 +669,11 @@ mod tests {
             Ok(())
         }
 
+        fn start_docker(&self, _vm: &str) -> Result<()> {
+            self.note("start_docker");
+            Ok(())
+        }
+
         fn model_uses_bearer(&self, model: &str) -> Result<bool> {
             self.note(format!("bearer: {model}"));
             Ok(true)
@@ -672,7 +705,7 @@ mod tests {
             let mounts = seen.spec.as_ref().map(|s| s.5.clone()).unwrap_or_default();
             let host = |guest: &str| mounts.iter().find(|m| m.1 == guest).map(|m| m.0.clone());
             if let Some(home) = host(GUEST_HOME) {
-                for file in [".claude/settings.json", ".claude.json"] {
+                for file in [".claude/settings.json", ".claude.json", ".docker/config.json"] {
                     if let Ok(text) = fs::read_to_string(home.join(file)) {
                         seen.files.insert(file.to_string(), text);
                     }
@@ -754,6 +787,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
     fn runs_a_box_in_order_and_puts_it_away() {
         let s = setup();
         let p = policy(&s, "");
@@ -817,9 +851,29 @@ mod tests {
         assert!(seen.files.contains_key("work/proj"), "the clone: {:?}", seen.files.keys());
         assert_eq!(seen.files["work/proj/README"], "original");
         assert!(!seen.files.contains_key("work/data"), "ro folders are not copied");
+        assert!(!seen.files.contains_key(".docker/config.json"), "no Docker settings without docker = true");
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
+    fn a_docker_box_starts_dockerd_after_the_ca_and_before_the_agent() {
+        let s = setup();
+        let mut p = policy(&s, "");
+        p.docker = true;
+        let fake = Fake::default();
+        run(&s.layout, &fake, &request(&s, &p, false)).unwrap();
+
+        let calls = fake.calls();
+        let at = |call: &str| calls.iter().position(|c| c == call).unwrap();
+        assert!(at("install_ca") < at("start_docker") && at("start_docker") < at("exec"), "{calls:?}");
+        let seen = fake.seen.lock().unwrap();
+        assert!(seen.spec.as_ref().unwrap().6, "the VM is made for Docker");
+        let config: Value = serde_json::from_str(&seen.files[".docker/config.json"]).unwrap();
+        assert_eq!(config["proxies"]["default"]["httpsProxy"], json!("http://172.17.0.1:3128"));
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
     fn a_kept_box_keeps_its_files_and_its_own_copy() {
         let s = setup();
         let p = policy(&s, "");
@@ -875,6 +929,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
     fn replaces_a_vm_nobody_runs() {
         let s = setup();
         let p = policy(&s, "");
@@ -915,6 +970,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
     fn puts_everything_away_when_the_door_fails() {
         let s = setup();
         let p = policy(&s, "");
@@ -927,6 +983,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
     fn a_signal_stops_the_box_and_puts_it_away() {
         let s = setup();
         let p = policy(&s, "");
@@ -944,6 +1001,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
     fn a_temporary_box_has_its_own_name_and_lock() {
         let s = setup();
         let p = policy(&s, "");
@@ -956,6 +1014,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
     fn a_temporary_box_keeps_its_ca_in_memory_only() {
         let s = setup();
         let p = policy(&s, "");
@@ -972,6 +1031,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
     fn a_kept_box_gets_a_ca_once_sealed_in_its_store() {
         let s = setup();
         let p = policy(&s, "");
@@ -1016,6 +1076,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
     fn sessions_are_sealed_in_the_store_and_no_vm_mounts_them() {
         let s = setup();
         let p = policy(&s, "");
@@ -1054,6 +1115,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
     fn a_box_that_keeps_no_sessions_never_writes_one() {
         let s = setup();
         let p = policy(&s, "[browser]\nkeep_sessions = false");
@@ -1076,7 +1138,7 @@ mod tests {
         fs::create_dir_all(home.join(".claude")).unwrap();
         fs::write(home.join(".claude/settings.json"), r#"{"theme":"dark","skipWebFetchPreflight":false}"#).unwrap();
         fs::write(home.join(".claude.json"), r#"{"mcpServers":{"mine":{"command":"x"}},"cred":1}"#).unwrap();
-        prepare_home(&home).unwrap();
+        prepare_home(&home, false).unwrap();
         let settings: Value = serde_json::from_str(&fs::read_to_string(home.join(".claude/settings.json")).unwrap()).unwrap();
         assert_eq!((settings["theme"].clone(), settings["skipWebFetchPreflight"].clone()), (json!("dark"), json!(true)));
         let claude: Value = serde_json::from_str(&fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();
@@ -1084,7 +1146,14 @@ mod tests {
         assert_eq!(claude["mcpServers"]["cred"]["command"], json!("cred-shim"));
 
         fs::write(home.join(".claude.json"), "not json").unwrap();
-        prepare_home(&home).unwrap();
+        prepare_home(&home, false).unwrap();
         assert!(fs::read_to_string(home.join(".claude.json")).unwrap().contains("cred-shim"), "a broken file is replaced");
+
+        assert!(!home.join(".docker").exists());
+        fs::create_dir_all(home.join(".docker")).unwrap();
+        fs::write(home.join(".docker/config.json"), r#"{"auths":{"x":{}}}"#).unwrap();
+        prepare_home(&home, true).unwrap();
+        let docker: Value = serde_json::from_str(&fs::read_to_string(home.join(".docker/config.json")).unwrap()).unwrap();
+        assert_eq!((docker["auths"]["x"].clone(), docker["proxies"]["default"]["noProxy"].clone()), (json!({}), json!("localhost,127.0.0.1")));
     }
 }
