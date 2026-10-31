@@ -214,3 +214,36 @@ fn one_thread_can_read_while_another_writes() {
     assert!(all.iter().all(|&b| b == 7));
     assert_eq!(server.join().unwrap(), 1 << 20);
 }
+
+#[test]
+fn a_site_s_records_of_mixed_sizes_are_read_whole() {
+    // rustls takes no more input once it holds over 16 KiB of plaintext, and one full record is
+    // 16 KiB. A site that mixes full and small records (CDNs grow their records as a download
+    // goes on) puts that much in one read from the socket.
+    let sites = BoxCa::generate("sites").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = sites.server_config("example.com").unwrap();
+    let pattern: Vec<Vec<u8>> = (0..64u8).flat_map(|i| std::iter::once(vec![i; 16 * 1024]).chain((0..8).map(move |_| vec![i; 100]))).collect();
+    let expected: Vec<u8> = pattern.concat();
+    thread::spawn(move || {
+        let (tcp, _) = listener.accept().unwrap();
+        let mut tls = StreamOwned::new(ServerConnection::new(config).unwrap(), tcp);
+        let mut byte = [0u8; 1];
+        tls.read_exact(&mut byte).unwrap();
+        for record in &pattern {
+            tls.write_all(record).unwrap();
+            tls.flush().unwrap();
+        }
+        tls.conn.send_close_notify();
+        tls.flush().unwrap();
+    });
+    let client = client_config_trusting(trust_only(&sites.cert_pem()));
+    let mut tls = connect(&client, "example.com", TcpStream::connect(addr).unwrap()).unwrap();
+    tls.write_all(b"z").unwrap();
+    // Let the socket fill, so reads from it are as large as they get.
+    thread::sleep(std::time::Duration::from_millis(200));
+    let mut got = Vec::new();
+    tls.read_to_end(&mut got).unwrap();
+    assert!(got == expected, "got {} bytes of {}", got.len(), expected.len());
+}
